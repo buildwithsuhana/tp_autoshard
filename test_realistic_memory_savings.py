@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
-Realistic memory savings test for sharded optimizer states.
-This test creates actual models and shows real memory usage differences.
+Test suite for realistic memory savings with tensor parallelism.
 """
 
 import time
 import logging
 import numpy as np
+import pytest
+
+# Import required modules
+try:
+    import keras
+    from keras import layers
+    from src.tensor_parallel_keras.coordinated_optimizer import CoordinatedOptimizer
+    print("✅ Required modules imported successfully")
+except ImportError as e:
+    print(f"❌ Import failed: {e}")
+    pytest.skip(f"Required modules not available: {e}")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def create_large_model():
     """Create a large model to demonstrate memory savings."""
@@ -32,151 +43,166 @@ def create_large_model():
     
     return model
 
+def get_optimizer_memory_info(optimizer, world_size, enable_sharding=True):
+    """Helper function to get memory usage for a given optimizer and world size."""
+    import keras
+    from src.tensor_parallel_keras.coordinated_optimizer import CoordinatedOptimizer
+    
+    coord_opt = CoordinatedOptimizer(
+        base_optimizer=optimizer,
+        world_size=world_size,
+        distributed_backend='fallback',
+        shard_optimizer_states=enable_sharding
+    )
+    
+    return coord_opt.get_memory_usage()
+
 def test_realistic_memory_savings():
-    """Test realistic memory savings with actual model parameters."""
+    """Test realistic memory savings with large models."""
     print("🚀 Testing Realistic Memory Savings")
     print("=" * 40)
     
     start_time = time.time()
+    print(f"⏱️  {time.time() - start_time:.2f}s: Starting realistic memory test...")
     
+    # Import required modules
     try:
-        print(f"⏱️  {time.time() - start_time:.2f}s: Starting realistic memory test...")
-        
-        # Import required modules
         import keras
-        from keras import optimizers
-        from src.tensor_parallel_keras.coordinated_optimizer import CoordinatedOptimizer
-        
+        from keras import layers
         print(f"✅ {time.time() - start_time:.2f}s: Modules imported successfully")
+    except ImportError as e:
+        pytest.skip(f"Required modules not available: {e}")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating large model...")
+    
+    # Create a large model for realistic testing
+    model = keras.Sequential([
+        layers.Input(shape=(784,)),
+        layers.Dense(2048, activation='relu'),
+        layers.Dense(4096, activation='relu'),
+        layers.Dense(2048, activation='relu'),
+        layers.Dense(1024, activation='relu'),
+        layers.Dense(512, activation='relu'),
+        layers.Dense(256, activation='relu'),
+        layers.Dense(128, activation='relu'),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(32, activation='relu'),
+        layers.Dense(10, activation='softmax')
+    ])
+    
+    print(f"✅ {time.time() - start_time:.2f}s: Model created with {model.count_params():,} parameters")
+    
+    # Test different world sizes
+    world_sizes = [2, 4, 8]
+    
+    print("\n🔄 Testing Adam Optimizer")
+    print("-" * 30)
+    
+    for world_size in world_sizes:
+        print(f"   World Size: {world_size}")
         
-        # Create a large model
-        print(f"⏱️  {time.time() - start_time:.2f}s: Creating large model...")
-        model = create_large_model()
+        # Test without sharding
+        optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        memory_info = get_optimizer_memory_info(optimizer, world_size, enable_sharding=False)
+        print(f"      No sharding: {memory_info}")
         
-        # Count parameters
-        total_params = sum(p.shape.num_elements() for p in model.weights)
-        print(f"✅ {time.time() - start_time:.2f}s: Model created with {total_params:,} parameters")
+        # Test with sharding
+        memory_info = get_optimizer_memory_info(optimizer, world_size, enable_sharding=True)
+        print(f"      With sharding: {memory_info}")
         
-        # Create different optimizers to test
-        optimizers_to_test = [
-            ('Adam', optimizers.Adam(learning_rate=0.001)),
-            ('SGD', optimizers.SGD(learning_rate=0.01, momentum=0.9)),
-            ('RMSprop', optimizers.RMSprop(learning_rate=0.001))
-        ]
+        if memory_info['sharding_enabled']:
+            savings = memory_info['memory_savings']
+            theoretical_max = f"{(1 - 1/world_size) * 100:.1f}%"
+            print(f"      💾 Memory savings: {savings}")
+            print(f"      📊 Theoretical max savings: {theoretical_max}")
+    
+    print("\n🔄 Testing SGD Optimizer")
+    print("-" * 30)
+    
+    for world_size in world_sizes:
+        print(f"   World Size: {world_size}")
         
-        world_sizes = [2, 4, 8]
+        # Test without sharding
+        optimizer = keras.optimizers.SGD(learning_rate=0.01, momentum=0.9)
+        memory_info = get_optimizer_memory_info(optimizer, world_size, enable_sharding=False)
+        print(f"      No sharding: {memory_info}")
         
-        for opt_name, base_optimizer in optimizers_to_test:
-            print(f"\n🔄 Testing {opt_name} Optimizer")
-            print("-" * 30)
-            
-            for world_size in world_sizes:
-                print(f"   World Size: {world_size}")
-                
-                # Test WITHOUT sharding
-                coord_opt_no_sharding = CoordinatedOptimizer(
-                    base_optimizer=base_optimizer,
-                    world_size=world_size,
-                    distributed_backend='fallback',
-                    shard_optimizer_states=False
-                )
-                
-                memory_info_no_sharding = coord_opt_no_sharding.get_memory_usage()
-                print(f"      No sharding: {memory_info_no_sharding}")
-                
-                # Test WITH sharding
-                coord_opt_with_sharding = CoordinatedOptimizer(
-                    base_optimizer=base_optimizer,
-                    world_size=world_size,
-                    distributed_backend='fallback',
-                    shard_optimizer_states=True
-                )
-                
-                memory_info_with_sharding = coord_opt_with_sharding.get_memory_usage()
-                print(f"      With sharding: {memory_info_with_sharding}")
-                
-                # Show savings
-                if (memory_info_no_sharding['sharding_enabled'] == False and 
-                    memory_info_with_sharding['sharding_enabled'] == True):
-                    if 'memory_savings' in memory_info_with_sharding:
-                        savings = memory_info_with_sharding['memory_savings']
-                        print(f"      💾 Memory savings: {savings}")
-                        
-                        # Calculate theoretical savings
-                        theoretical_savings = ((world_size - 1) / world_size) * 100
-                        print(f"      📊 Theoretical max savings: {theoretical_savings:.1f}%")
+        # Test with sharding
+        memory_info = get_optimizer_memory_info(optimizer, world_size, enable_sharding=True)
+        print(f"      With sharding: {memory_info}")
         
-        print(f"\n✅ Realistic memory test completed in {time.time() - start_time:.2f}s")
-        return True
+        if memory_info['sharding_enabled']:
+            savings = memory_info['memory_savings']
+            theoretical_max = f"{(1 - 1/world_size) * 100:.1f}%"
+            print(f"      💾 Memory savings: {savings}")
+            print(f"      📊 Theoretical max savings: {theoretical_max}")
+    
+    print("\n🔄 Testing RMSprop Optimizer")
+    print("-" * 30)
+    
+    for world_size in world_sizes:
+        print(f"   World Size: {world_size}")
         
-    except Exception as e:
-        total_time = time.time() - start_time
-        print(f"❌ Realistic memory test failed after {total_time:.2f}s: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        # Test without sharding
+        optimizer = keras.optimizers.RMSprop(learning_rate=0.001)
+        memory_info = get_optimizer_memory_info(optimizer, world_size, enable_sharding=False)
+        print(f"      No sharding: {memory_info}")
+        
+        # Test with sharding
+        memory_info = get_optimizer_memory_info(optimizer, world_size, enable_sharding=True)
+        print(f"      With sharding: {memory_info}")
+        
+        if memory_info['sharding_enabled']:
+            savings = memory_info['memory_savings']
+            theoretical_max = f"{(1 - 1/world_size) * 100:.1f}%"
+            print(f"      💾 Memory savings: {savings}")
+            print(f"      📊 Theoretical max savings: {theoretical_max}")
+    
+    print(f"✅ Realistic memory test completed in {time.time() - start_time:.2f}s")
 
 def test_optimizer_state_partitioning():
-    """Test how optimizer states are partitioned across shards."""
-    print("\n🔧 Testing Optimizer State Partitioning")
+    """Test optimizer state partitioning across devices."""
+    print("🔧 Testing Optimizer State Partitioning")
     print("=" * 40)
     
     start_time = time.time()
+    print(f"⏱️  {time.time() - start_time:.2f}s: Starting partitioning test...")
     
-    try:
-        print(f"⏱️  {time.time() - start_time:.2f}s: Starting partitioning test...")
-        
-        import keras
-        from keras import optimizers
-        from src.tensor_parallel_keras.coordinated_optimizer import CoordinatedOptimizer
-        
-        # Create a simple model
-        model = keras.Sequential([
-            keras.layers.Input(shape=(100,)),
-            keras.layers.Dense(50, activation='relu'),
-            keras.layers.Dense(10, activation='softmax')
-        ])
-        
-        # Create coordinated optimizer with sharding
-        base_optimizer = optimizers.Adam(learning_rate=0.001)
-        coord_opt = CoordinatedOptimizer(
-            base_optimizer=base_optimizer,
-            world_size=4,
-            distributed_backend='fallback',
-            shard_optimizer_states=True
-        )
-        
-        print(f"✅ {time.time() - start_time:.2f}s: Coordinated optimizer created")
-        
-        # Examine sharded states
-        print(f"   Sharded states structure:")
-        for state_name, state_value in coord_opt.sharded_states.items():
-            if isinstance(state_value, dict):
-                print(f"     {state_name}:")
-                for param_name, param_states in state_value.items():
-                    print(f"       {param_name}: {len(param_states)} shards")
-                    for i, shard_state in enumerate(param_states):
-                        if hasattr(shard_state, 'shape'):
-                            print(f"         Shard {i}: {shard_state.shape}")
-                        else:
-                            print(f"         Shard {i}: {type(shard_state).__name__}")
-            else:
-                print(f"     {state_name}: {len(state_value)} shards")
-                for i, shard_state in enumerate(state_value):
-                    if hasattr(shard_state, 'shape'):
-                        print(f"       Shard {i}: {shard_state.shape}")
-                    else:
-                        print(f"       Shard {i}: {type(shard_state).__name__}")
-        
-        print(f"✅ Partitioning test completed in {time.time() - start_time:.2f}s")
-        return True
-        
-    except Exception as e:
-        total_time = time.time() - start_time
-        print(f"❌ Partitioning test failed after {total_time:.2f}s: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    # Create a simple model
+    model = keras.Sequential([
+        layers.Input(shape=(10,)),
+        layers.Dense(100, activation='relu'),
+        layers.Dense(50, activation='relu'),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    
+    # Create coordinated optimizer with sharded states
+    optimizer = CoordinatedOptimizer(
+        base_optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        world_size=4,
+        shard_optimizer_states=True
+    )
+    
+    print(f"✅ {time.time() - start_time:.2f}s: Coordinated optimizer created")
+    
+    # Get sharded states structure
+    sharded_states = optimizer._get_sharded_states_structure()
+    print(f"   Sharded states structure:")
+    
+    for state_name, state_info in sharded_states.items():
+        if isinstance(state_info, dict):
+            print(f"     {state_name}:")
+            for var_name, var_info in state_info.items():
+                if isinstance(var_info, dict) and 'num_shards' in var_info:
+                    print(f"       {var_name}: {var_info['num_shards']} shards")
+                    for i, shape in enumerate(var_info['shard_shapes']):
+                        print(f"         Shard {i}: {shape}")
+                else:
+                    print(f"       {var_name}: {var_info}")
+        else:
+            print(f"     {state_name}: {state_info}")
+    
+    print(f"✅ Partitioning test completed in {time.time() - start_time:.2f}s")
 
 if __name__ == "__main__":
     print("🎯 REALISTIC MEMORY SAVINGS TEST")

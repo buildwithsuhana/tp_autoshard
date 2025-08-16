@@ -458,55 +458,93 @@ class CoordinatedOptimizer:
             opt.set_weights(shard_weights)
     
     def get_memory_usage(self):
-        """Get memory usage information for optimizer states."""
-        if not self.shard_optimizer_states:
-            return {
-                'sharding_enabled': False,
-                'total_memory': 'Unknown (replicated states)',
-                'memory_per_shard': 'Unknown (replicated states)',
-                'memory_savings': '0%'
-            }
-        
+        """Get memory usage information for the coordinated optimizer."""
         try:
-            total_params = 0
-            sharded_params = 0
+            if not hasattr(self, 'sharded_states') or not self.sharded_states:
+                return {
+                    'sharding_enabled': False,
+                    'total_memory': '0.00 MB',
+                    'sharded_memory': '0.00 MB',
+                    'memory_savings': '0.00%'
+                }
             
-            # Calculate memory usage
-            for state_name, state_value in self.sharded_states.items():
-                if isinstance(state_value, dict):
-                    for param_name, param_states in state_value.items():
-                        for param_state in param_states:
-                            if hasattr(param_state, 'nbytes'):
-                                sharded_params += param_state.nbytes
-                            elif hasattr(param_state, 'numpy'):
-                                sharded_params += param_state.numpy().nbytes
-                            else:
-                                sharded_params += np.array(param_state).nbytes
+            # Calculate memory usage for sharded states
+            total_memory_bytes = 0
+            sharded_memory_bytes = 0
+            
+            for state_name, state_info in self.sharded_states.items():
+                if isinstance(state_info, dict):
+                    # Handle nested state structures (e.g., Adam's m and v)
+                    for var_name, var_states in state_info.items():
+                        if isinstance(var_states, list):
+                            for shard_state in var_states:
+                                if hasattr(shard_state, 'numel'):
+                                    # PyTorch tensor
+                                    shard_memory = shard_state.numel() * shard_state.element_size()
+                                    total_memory_bytes += shard_memory
+                                    sharded_memory_bytes += shard_memory
+                                elif hasattr(shard_state, 'nbytes'):
+                                    # NumPy array
+                                    shard_memory = shard_state.nbytes
+                                    total_memory_bytes += shard_memory
+                                    sharded_memory_bytes += shard_memory
+                                elif hasattr(shard_state, 'shape'):
+                                    # Estimate memory for other types
+                                    shard_memory = np.prod(shard_state.shape) * 4  # Assume float32
+                                    total_memory_bytes += shard_memory
+                                    sharded_memory_bytes += shard_memory
                 else:
-                    for param_state in state_value:
-                        if hasattr(param_state, 'nbytes'):
-                            sharded_params += param_state.nbytes
-                        elif hasattr(param_state, 'numpy'):
-                            sharded_params += param_state.numpy().nbytes
-                        else:
-                            sharded_params += np.array(param_state).nbytes
+                    # Handle simple state structures
+                    if isinstance(state_info, list):
+                        for shard_state in state_info:
+                            if hasattr(shard_state, 'numel'):
+                                # PyTorch tensor
+                                shard_memory = shard_state.numel() * shard_state.element_size()
+                                total_memory_bytes += shard_memory
+                                sharded_memory_bytes += shard_memory
+                            elif hasattr(shard_state, 'nbytes'):
+                                # NumPy array
+                                shard_memory = shard_state.nbytes
+                                total_memory_bytes += shard_memory
+                                sharded_memory_bytes += shard_memory
+                            elif hasattr(shard_state, 'shape'):
+                                # Estimate memory for other types
+                                shard_memory = np.prod(shard_state.shape) * 4  # Assume float32
+                                total_memory_bytes += shard_memory
+                                sharded_memory_bytes += shard_memory
             
-            # Estimate total memory if states were replicated
-            total_params = sharded_params * self.world_size
-            memory_savings = ((total_params - sharded_params) / total_params) * 100
+            # Calculate memory savings
+            if total_memory_bytes > 0:
+                # Calculate what the memory would be without sharding (replicated on each device)
+                replicated_memory_bytes = total_memory_bytes * self.world_size
+                savings_bytes = replicated_memory_bytes - sharded_memory_bytes
+                savings_percentage = (savings_bytes / replicated_memory_bytes) * 100
+                
+                memory_savings = f"{savings_percentage:.2f}%"
+            else:
+                memory_savings = "0.00%"
+            
+            # Convert bytes to MB
+            total_memory_mb = total_memory_bytes / (1024 * 1024)
+            sharded_memory_mb = sharded_memory_bytes / (1024 * 1024)
             
             return {
                 'sharding_enabled': True,
-                'total_memory': f"{total_params / (1024**2):.2f} MB",
-                'sharded_memory': f"{sharded_params / (1024**2):.2f} MB",
-                'memory_per_shard': f"{sharded_params / self.world_size / (1024**2):.2f} MB",
-                'memory_savings': f"{memory_savings:.1f}%"
+                'total_memory': f"{total_memory_mb:.2f} MB",
+                'sharded_memory': f"{sharded_memory_mb:.2f} MB",
+                'memory_savings': memory_savings,
+                'world_size': self.world_size,
+                'total_memory_bytes': total_memory_bytes,
+                'sharded_memory_bytes': sharded_memory_bytes
             }
             
         except Exception as e:
-            logger.warning(f"Could not calculate memory usage: {e}")
+            logger.warning(f"Memory calculation failed: {e}")
             return {
-                'sharding_enabled': self.shard_optimizer_states,
+                'sharding_enabled': False,
+                'total_memory': '0.00 MB',
+                'sharded_memory': '0.00 MB',
+                'memory_savings': '0.00%',
                 'error': str(e)
             }
     
@@ -529,6 +567,49 @@ class CoordinatedOptimizer:
             logger.info("Optimizer state sharding disabled, using replicated states")
         else:
             logger.info("Optimizer state sharding already disabled")
+
+    def _get_sharded_states_structure(self):
+        """Get the structure of sharded states for analysis."""
+        if not hasattr(self, 'sharded_states') or not self.sharded_states:
+            return {}
+        
+        structure = {}
+        
+        for state_name, state_info in self.sharded_states.items():
+            if isinstance(state_info, dict):
+                # Handle nested state structures (e.g., Adam's m and v)
+                structure[state_name] = {}
+                for var_name, var_states in state_info.items():
+                    if isinstance(var_states, list):
+                        num_shards = len(var_states)
+                        shard_shapes = []
+                        for shard_state in var_states:
+                            if hasattr(shard_state, 'shape'):
+                                shard_shapes.append(shard_state.shape)
+                            else:
+                                shard_shapes.append('unknown')
+                        
+                        structure[state_name][var_name] = {
+                            'num_shards': num_shards,
+                            'shard_shapes': shard_shapes
+                        }
+            else:
+                # Handle simple state structures
+                if isinstance(state_info, list):
+                    num_shards = len(state_info)
+                    shard_shapes = []
+                    for shard_state in state_info:
+                        if hasattr(shard_state, 'shape'):
+                            shard_shapes.append(shard_state.shape)
+                        else:
+                            shard_shapes.append('unknown')
+                    
+                    structure[state_name] = {
+                        'num_shards': num_shards,
+                        'shard_shapes': shard_shapes
+                    }
+        
+        return structure
 
 
 class TensorParallelOptimizer(optimizers.Optimizer):

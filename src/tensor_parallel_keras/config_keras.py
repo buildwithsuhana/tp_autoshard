@@ -29,19 +29,10 @@ class ConfigKeras:
         world_size = len(devices)
         all_cuda = all(device.startswith("gpu") for device in devices)
         
-        # Determine which backend to use
-        if distributed and torch.distributed.is_initialized():
-            # Use PyTorch distributed if available
-            make_allreduce = lambda ws: AllReduceKeras(ws, distributed=True)
-            make_allgather = lambda ws, dim: AllGatherKeras(ws, dim, distributed=True)
-        elif all_cuda:
-            # Use CUDA operations for GPU devices
-            make_allreduce = lambda ws: AllReduceKeras(ws, distributed=False)
-            make_allgather = lambda ws, dim: AllGatherKeras(ws, dim, distributed=False)
-        else:
-            # Use cross-device operations for CPU/mixed devices
-            make_allreduce = lambda ws: AllReduceKeras(ws, distributed=False)
-            make_allgather = lambda ws, dim: AllGatherKeras(ws, dim, distributed=False)
+        # Use new communication operations
+        make_allreduce = lambda ws: AllReduceKeras(ws, op="mean")
+        make_allgather = lambda ws, dim: AllGatherKeras(ws, dim)
+        make_broadcast = lambda ws: BroadcastKeras(ws)
             
         # Convert rules to operations
         def create_collective_ops(rules: Dict[str, Any]) -> Dict[str, Any]:
@@ -60,7 +51,7 @@ class ConfigKeras:
                                     dim = int(action.split(" ")[1])
                                 result[pattern][key] = make_allgather(world_size, dim)
                             elif action == "broadcast":
-                                result[pattern][key] = BroadcastKeras(world_size)
+                                result[pattern][key] = make_broadcast(world_size)
                             else:
                                 result[pattern][key] = action
                         else:

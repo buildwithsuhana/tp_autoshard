@@ -95,16 +95,73 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_
                     # For LSTM, we need to handle the gates properly
                     pass
                     
-            # Handle Attention layers
+            # Handle Attention layers with Column -> Row pattern
             elif isinstance(layer, layers.MultiHeadAttention):
-                # Split query, key, value projections
-                state_rules[f"^{full_name}.query_dense.kernel$"] = SplitKeras(world_size=world_size, dim=0)
-                state_rules[f"^{full_name}.key_dense.kernel$"] = SplitKeras(world_size=world_size, dim=0)
-                state_rules[f"^{full_name}.value_dense.kernel$"] = SplitKeras(world_size=world_size, dim=0)
-                state_rules[f"^{full_name}.output_dense.kernel$"] = SplitKeras(world_size=world_size, dim=1)
+                # QKV Projection: Column-sharded (split output dimension)
+                # This means the weight matrices are split along the output dimension
+                state_rules[f"^{full_name}.query_dense.kernel$"] = SplitKeras(world_size=world_size, dim=1)
+                state_rules[f"^{full_name}.key_dense.kernel$"] = SplitKeras(world_size=world_size, dim=1)
+                state_rules[f"^{full_name}.value_dense.kernel$"] = SplitKeras(world_size=world_size, dim=1)
                 
-                # Output needs to be gathered
-                output_rules[f"^{full_name}$"] = {0: "gather -1"}
+                # QKV biases: Column-sharded (split output dimension)
+                if hasattr(layer.query_dense, 'bias') and layer.query_dense.bias is not None:
+                    state_rules[f"^{full_name}.query_dense.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                if hasattr(layer.key_dense, 'bias') and layer.key_dense.bias is not None:
+                    state_rules[f"^{full_name}.key_dense.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                if hasattr(layer.value_dense, 'bias') and layer.value_dense.bias is not None:
+                    state_rules[f"^{full_name}.value_dense.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                
+                # Output Projection: Row-sharded (split input dimension)
+                # This means the weight matrix is split along the input dimension
+                state_rules[f"^{full_name}.output_dense.kernel$"] = SplitKeras(world_size=world_size, dim=0)
+                if hasattr(layer.output_dense, 'bias') and layer.output_dense.bias is not None:
+                    state_rules[f"^{full_name}.output_dense.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                
+                # QKV outputs are distributed (no communication needed)
+                # Output projection result needs AllReduce to combine
+                output_rules[f"^{full_name}$"] = {0: "allreduce"}
+                
+                logger.info(f"Applied Column->Row pattern to {full_name}")
+            
+            # Handle MLP/Feed-Forward Network layers with Column -> Row pattern
+            elif isinstance(layer, layers.Dense) and "mlp" in full_name.lower():
+                # MLP layers follow the same Column -> Row pattern as attention
+                # First Dense layer (up-projection): Column-sharded (split output dimension)
+                if "up" in full_name.lower() or "h_to_4h" in full_name.lower() or "gate" in full_name.lower():
+                    # Column-wise sharding: split output dimension
+                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=1)
+                    if layer.use_bias:
+                        state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                    
+                    # Output is distributed (no communication needed)
+                    output_rules[f"^{full_name}$"] = {0: "no_comm"}
+                    
+                    logger.info(f"Applied Column-wise sharding to MLP up-projection {full_name}")
+                
+                # Second Dense layer (down-projection): Row-sharded (split input dimension)
+                elif "down" in full_name.lower() or "4h_to_h" in full_name.lower() or "proj" in full_name.lower():
+                    # Row-wise sharding: split input dimension
+                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=0)
+                    if layer.use_bias:
+                        state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                    
+                    # Output needs AllReduce to combine
+                    output_rules[f"^{full_name}$"] = {0: "allreduce"}
+                    
+                    logger.info(f"Applied Row-wise sharding to MLP down-projection {full_name}")
+                
+                # Generic MLP handling (if naming doesn't match specific patterns)
+                else:
+                    # Assume first layer is column-sharded, second is row-sharded
+                    # This is a fallback for generic MLP layers
+                    if "first" in full_name.lower() or "1" in full_name:
+                        state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=1)
+                        output_rules[f"^{full_name}$"] = {0: "no_comm"}
+                        logger.info(f"Applied Column-wise sharding to generic MLP layer {full_name}")
+                    else:
+                        state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=0)
+                        output_rules[f"^{full_name}$"] = {0: "allreduce"}
+                        logger.info(f"Applied Row-wise sharding to generic MLP layer {full_name}")
                 
             # Handle LayerNormalization layers
             elif isinstance(layer, layers.LayerNormalization):

@@ -3,6 +3,7 @@ Automatic configuration for Keras Tensor Parallel
 """
 
 import re
+import logging
 from typing import Dict, Sequence, Union
 
 import torch
@@ -10,6 +11,8 @@ from keras import layers, Model
 
 from .config_keras import ConfigKeras
 from .state_actions_keras import SplitKeras, GatherKeras, SumKeras
+
+logger = logging.getLogger(__name__)
 
 
 def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_strategy: str = "auto") -> ConfigKeras:

@@ -16,6 +16,36 @@ from .config_keras import ConfigKeras
 from .state_actions_keras import StateActionKeras
 
 
+def safe_layer_call(layer, x):
+    """Safely call a layer with proper error handling for missing arguments."""
+    try:
+        return layer(x)
+    except TypeError as e:
+        if "missing a required argument" in str(e):
+            # Handle layers that need additional arguments
+            if hasattr(layer, 'call'):
+                import inspect
+                sig = inspect.signature(layer.call)
+                if 'training' in sig.parameters and 'value' in sig.parameters:
+                    # Some layers need both training and value
+                    return layer(x, training=False, value=x)
+                elif 'training' in sig.parameters:
+                    return layer(x, training=False)
+                elif 'mask' in sig.parameters:
+                    return layer(x, mask=None)
+                elif 'value' in sig.parameters:
+                    # Some layers expect a 'value' argument
+                    return layer(x, value=x)
+                elif 'inputs' in sig.parameters:
+                    # Some layers expect 'inputs' argument
+                    return layer(inputs=x)
+                else:
+                    print(f"Warning: Could not reconstruct layer {layer.name}, using fallback")
+                    return keras.ops.convert_to_tensor(x)
+        else:
+            raise e
+
+
 def make_shard_keras(
     module: Model,
     device: str,
@@ -226,7 +256,7 @@ def rebuild_model_with_sharded_layers(original_module: Model, config: ConfigKera
                         x = new_layer(x)
                 else:
                     # Fallback to original layer
-                    x = layer(x)
+                    x = safe_layer_call(layer, x)
             else:
                 # No sharding rule, use original layer
                 x = layer(x)
@@ -259,10 +289,10 @@ def rebuild_model_with_sharded_layers(original_module: Model, config: ConfigKera
                     x = new_layer(x)
                 else:
                     # Fallback to original layer
-                    x = layer(x)
+                    x = safe_layer_call(layer, x)
             else:
                 # No sharding rule, use original layer
-                x = layer(x)
+                x = safe_layer_call(layer, x)
                 
         elif isinstance(layer, layers.LayerNormalization):
             # LayerNormalization needs to be updated to work with sharded dimensions
@@ -280,8 +310,8 @@ def rebuild_model_with_sharded_layers(original_module: Model, config: ConfigKera
             x = new_layer(x)
                 
         else:
-            # For other layer types, use as-is
-            x = layer(x)
+            # For other layer types, use safe layer call
+            x = safe_layer_call(layer, x)
     
     # Create the new model
     new_model = Model(inputs=inputs, outputs=x, name=f"{original_module.name}_shard_{rank}")

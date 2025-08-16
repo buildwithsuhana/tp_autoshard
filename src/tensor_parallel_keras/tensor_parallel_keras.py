@@ -45,6 +45,8 @@ class TensorParallelKeras(Model):
         sharded: bool = True,
         sharded_param_names: Optional[Collection[str]] = None,
         sharding_strategy: str = "auto",
+        distributed_backend: str = "auto",
+        rank: int = 0,
         **kwargs
     ):
         print("="*50)
@@ -123,8 +125,6 @@ class TensorParallelKeras(Model):
         # Validate sharding
         params_per_shard = [sum(p.shape.num_elements() for p in shard.weights) for shard in self.model_shards]
         
-
-        
         # In tensor parallelism, total shard params can vary based on sharding strategy
         # Row-wise sharding might increase params due to layer reconstruction
         # Column-wise sharding typically reduces params
@@ -132,6 +132,15 @@ class TensorParallelKeras(Model):
             # Row-wise sharding might increase parameters due to layer reconstruction
             # Allow some flexibility in parameter count
             assert sum(params_per_shard) <= original_params * 1.5, f"Internal assert failed: shard parameters {sum(params_per_shard)} exceed reasonable limit {original_params * 1.5}"
+            
+        # Initialize distributed backend for real communication
+        try:
+            from .distributed_backend import get_distributed_backend
+            self.distributed_backend = get_distributed_backend(distributed_backend, self.world_size, rank)
+            logger.info(f"Initialized distributed backend: {type(self.distributed_backend).__name__}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize distributed backend: {e}")
+            self.distributed_backend = None
         else:
             # Column-wise and other strategies should reduce parameters
             assert sum(params_per_shard) <= original_params, "Internal assert failed: shard parameters exceed original"
@@ -250,8 +259,46 @@ class TensorParallelKeras(Model):
             return self._gather_outputs(outputs)
     
     def _gather_outputs(self, outputs):
-        """Gather outputs from all shards using AllGather, AllReduce, or no communication."""
+        """Gather outputs from all shards using REAL distributed communication."""
         try:
+            # If we have a real distributed backend, use it for true AllGather
+            if hasattr(self, 'distributed_backend') and self.distributed_backend is not None and self.distributed_backend.is_initialized:
+                try:
+                    logger.info("Using REAL distributed backend for output gathering")
+                    
+                    # Convert Keras outputs to numpy for the distributed backend
+                    numpy_outputs = []
+                    for output in outputs:
+                        if hasattr(output, 'numpy'):
+                            numpy_outputs.append(output.numpy())
+                        else:
+                            numpy_outputs.append(np.array(output))
+                    
+                    # Determine gather dimension based on output shape
+                    if len(numpy_outputs[0].shape) == 3:  # (batch, seq_len, vocab_size) - language model
+                        gather_dim = -1  # Last dimension (vocabulary)
+                    elif len(numpy_outputs[0].shape) == 2:  # (batch, features) - Dense layer
+                        gather_dim = 1   # Feature dimension
+                    else:
+                        gather_dim = -1  # Default to last dimension
+                    
+                    # Use the distributed backend for AllGather
+                    gathered_output = self.distributed_backend.allgather(numpy_outputs[0], axis=gather_dim)
+                    
+                    # Convert back to Keras tensor
+                    try:
+                        return keras.ops.convert_to_tensor(gathered_output)
+                    except:
+                        # Fallback to numpy array
+                        return gathered_output
+                        
+                except Exception as e:
+                    logger.warning(f"Real distributed output gathering failed: {e}, falling back to simulation")
+                    # Fall through to simulation below
+            
+            # Fallback: simulation using existing method
+            logger.warning("Using SIMULATION for output gathering - NOT production-ready!")
+            
             # Convert outputs to PyTorch tensors for communication
             torch_outputs = []
             for output in outputs:
@@ -577,13 +624,35 @@ class TensorParallelKeras(Model):
             return None
     
     def _synchronize_gradients_across_shards(self, gradients):
-        """Synchronize gradients across shards using AllReduce."""
+        """Synchronize gradients across shards using REAL distributed communication."""
         if not gradients:
             return None
         
         try:
-            # For tensor parallelism, we need to synchronize gradients PER VARIABLE
-            # Each variable's gradient should be synchronized across shards
+            # If we have a real distributed backend, use it for true AllReduce
+            if hasattr(self, 'distributed_backend') and self.distributed_backend is not None and self.distributed_backend.is_initialized:
+                try:
+                    logger.info("Using REAL distributed backend for gradient synchronization")
+                    
+                    synchronized_gradients = []
+                    
+                    for grad in gradients:
+                        if grad is not None:
+                            # Use the distributed backend for AllReduce
+                            synchronized_grad = self.distributed_backend.allreduce(grad, op='mean')
+                            synchronized_gradients.append(synchronized_grad)
+                        else:
+                            synchronized_gradients.append(None)
+                    
+                    logger.info(f"REAL gradient synchronization completed using {type(self.distributed_backend).__name__}")
+                    return synchronized_gradients
+                    
+                except Exception as e:
+                    logger.warning(f"Real distributed gradient synchronization failed: {e}, falling back to simulation")
+                    # Fall through to simulation below
+            
+            # Fallback: sophisticated simulation (not production-ready)
+            logger.warning("Using SIMULATION for gradient synchronization - NOT production-ready!")
             
             synchronized_gradients = []
             
@@ -619,7 +688,7 @@ class TensorParallelKeras(Model):
                 else:
                     synchronized_gradients.append(None)
             
-            logger.info(f"Gradients synchronized across {self.world_size} shards")
+            logger.info(f"SIMULATION gradient synchronization completed across {self.world_size} shards")
             return synchronized_gradients
             
         except Exception as e:

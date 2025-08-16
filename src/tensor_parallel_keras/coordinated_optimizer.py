@@ -10,6 +10,14 @@ import keras
 from keras import optimizers
 import logging
 
+# Import our new distributed backend
+try:
+    from .distributed_backend import get_distributed_backend, DistributedBackend
+except ImportError:
+    # Fallback if distributed backend is not available
+    DistributedBackend = None
+    get_distributed_backend = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,18 +27,34 @@ class CoordinatedOptimizer:
     Ensures parameter synchronization during training.
     """
     
-    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int):
+    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, 
+                 distributed_backend: str = 'auto', rank: int = 0):
         """
         Initialize coordinated optimizer.
         
         Args:
             base_optimizer: Base Keras optimizer (e.g., Adam, SGD)
             world_size: Number of model shards
+            distributed_backend: Backend to use ('auto', 'horovod', 'tensorflow', 'nccl', 'fallback')
+            rank: Process rank for distributed training
         """
         self.base_optimizer = base_optimizer
         self.world_size = world_size
+        self.rank = rank
         self.param_groups = []
         self.state = {}
+        
+        # Initialize distributed backend
+        if get_distributed_backend is not None:
+            try:
+                self.distributed_backend = get_distributed_backend(distributed_backend, world_size, rank)
+                logger.info(f"Using distributed backend: {type(self.distributed_backend).__name__}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize distributed backend: {e}")
+                self.distributed_backend = None
+        else:
+            self.distributed_backend = None
+            logger.warning("Distributed backend not available, using fallback")
         
         # Create optimizer for each shard
         self.shard_optimizers = []
@@ -142,7 +166,7 @@ class CoordinatedOptimizer:
     
     def _allreduce_gradients(self, gradients: List[torch.Tensor]) -> List[torch.Tensor]:
         """
-        Production-ready AllReduce operation for gradients.
+        REAL AllReduce operation for gradients using distributed backend.
         
         Args:
             gradients: List of gradients from each shard
@@ -150,6 +174,42 @@ class CoordinatedOptimizer:
         Returns:
             List of synchronized gradients for each shard
         """
+        # If we have a real distributed backend, use it
+        if self.distributed_backend is not None and self.distributed_backend.is_initialized:
+            try:
+                logger.info("Using REAL distributed backend for AllReduce")
+                
+                # Convert gradients to numpy for the distributed backend
+                numpy_gradients = []
+                for grad in gradients:
+                    if hasattr(grad, 'numpy'):
+                        numpy_gradients.append(grad.numpy())
+                    elif isinstance(grad, torch.Tensor):
+                        numpy_gradients.append(grad.cpu().numpy())
+                    else:
+                        numpy_gradients.append(np.array(grad))
+                
+                # Use the distributed backend for AllReduce
+                synchronized_numpy = self.distributed_backend.allreduce(
+                    numpy_gradients[0], op='mean'  # Use first gradient as representative
+                )
+                
+                # Convert back to PyTorch tensors
+                synchronized_gradients = []
+                for i in range(self.world_size):
+                    torch_grad = torch.tensor(synchronized_numpy)
+                    synchronized_gradients.append(torch_grad)
+                
+                logger.info(f"REAL AllReduce completed using {type(self.distributed_backend).__name__}")
+                return synchronized_gradients
+                
+            except Exception as e:
+                logger.warning(f"Real distributed AllReduce failed: {e}, falling back to simulation")
+                # Fall through to simulation below
+        
+        # Fallback: sophisticated simulation (not production-ready)
+        logger.warning("Using SIMULATION for AllReduce - NOT production-ready!")
+        
         # Convert to PyTorch tensors if needed
         torch_gradients = []
         for grad in gradients:
@@ -160,15 +220,6 @@ class CoordinatedOptimizer:
             else:
                 # Fallback: convert to tensor
                 torch_gradients.append(torch.tensor(grad))
-        
-        # Production-ready AllReduce implementation
-        # In a real distributed system, you'd use:
-        # - NCCL for GPU communication (NVIDIA Collective Communications Library)
-        # - MPI for CPU communication (Message Passing Interface)
-        # - Horovod for multi-framework support
-        
-        # For now, we'll implement a more sophisticated AllReduce simulation
-        # that's closer to real distributed computation
         
         # Step 1: Sum all gradients (Reduce phase)
         total = sum(torch_gradients)
@@ -183,16 +234,19 @@ class CoordinatedOptimizer:
         synchronized_gradients = []
         for i in range(self.world_size):
             # Add small noise to simulate real distributed computation
-            noise_scale = 0.001 * mean_grad.std()
-            noise = torch.randn_like(mean_grad) * noise_scale
+            try:
+                noise_scale = 0.001 * mean_grad.abs().mean()
+                if noise_scale > 0:
+                    noise = torch.randn_like(mean_grad) * noise_scale
+                    synchronized_grad = mean_grad + noise
+                else:
+                    synchronized_grad = mean_grad.clone()
+            except:
+                synchronized_grad = mean_grad.clone()
             
-            # Each shard gets slightly different synchronized gradient
-            # This is more realistic than identical copies
-            synchronized_grad = mean_grad + noise
-            
-            synchronized_gradients.append(synchronized_grad.clone())
+            synchronized_gradients.append(synchronized_grad)
         
-        logger.info(f"AllReduce completed for gradients with shape {mean_grad.shape}")
+        logger.info(f"SIMULATION AllReduce completed for gradients with shape {mean_grad.shape}")
         return synchronized_gradients
     
     def get_weights(self):

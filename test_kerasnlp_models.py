@@ -7,6 +7,8 @@ import time
 import logging
 import numpy as np
 import pytest
+import keras
+from keras import layers
 
 # Import KerasNLP
 try:
@@ -228,4 +230,163 @@ def test_training_with_kerasnlp():
     except Exception as e:
         print(f"      ⚠️  Tensor parallel model training failed: {e}")
     
-    print(f"✅ Training test completed in {time.time() - start_time:.2f}s") 
+    print(f"✅ Training test completed in {time.time() - start_time:.2f}s")
+
+
+def test_einsum_dense_layers():
+    """Test EinsumDense layers with tensor parallelism."""
+    print("🔧 Testing EinsumDense Layers")
+    print("=" * 50)
+    
+    start_time = time.time()
+    print(f"⏱️  {time.time() - start_time:.2f}s: Starting EinsumDense test...")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating model with EinsumDense layers...")
+    
+    # Create a model with EinsumDense layers (similar to OPT architecture)
+    inputs = keras.Input(shape=(10, 768))
+    
+    # MLP up-projection (similar to OPT MLP fc1)
+    mlp_up = keras.layers.EinsumDense(
+        equation="btd,de->bte",
+        output_shape=(10, 3072),
+        bias_axes="e"
+    )(inputs)
+    
+    # Activation
+    mlp_up = keras.layers.ReLU()(mlp_up)
+    
+    # MLP down-projection (similar to OPT MLP fc2)
+    mlp_down = keras.layers.EinsumDense(
+        equation="bte,de->btd",
+        output_shape=(10, 768),
+        bias_axes="d"
+    )(mlp_up)
+    
+    model = keras.Model(inputs=inputs, outputs=mlp_down)
+    
+    print(f"✅ {time.time() - start_time:.2f}s: EinsumDense model created with {model.count_params():,} parameters")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
+    
+    # Test tensor parallelism with 4 shards (like OPT-125M)
+    tp_model = TensorParallelKeras(
+        model=model,
+        world_size=4,
+        distributed_backend='fallback'
+    )
+    
+    print(f"✅ {time.time() - start_time:.2f}s: Tensor parallel EinsumDense model created successfully")
+    print(f"      Number of shards: {len(tp_model.model_shards)}")
+    print(f"      Devices: {tp_model.devices}")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Testing inference...")
+    
+    # Test inference
+    test_input = np.random.random((2, 10, 768)).astype(np.float32)
+    
+    try:
+        original_output = model(test_input)
+        tp_output = tp_model(test_input)
+        
+        print(f"      Original output shape: {original_output.shape}")
+        print(f"      TP output shape: {tp_output.shape}")
+        
+        # Check batch sizes match
+        assert original_output.shape[0] == tp_output.shape[0], "Batch sizes don't match"
+        print(f"      ✅ Batch sizes match")
+        
+        # Check sequence lengths match
+        assert original_output.shape[1] == tp_output.shape[1], "Sequence lengths don't match"
+        print(f"      ✅ Sequence lengths match")
+        
+        # Check hidden dimensions match
+        assert original_output.shape[2] == tp_output.shape[2], "Hidden dimensions don't match"
+        print(f"      ✅ Hidden dimensions match")
+        
+        print(f"      ✅ EinsumDense tensor parallelism working correctly")
+        
+    except Exception as e:
+        print(f"      ❌ Inference failed: {e}")
+        raise
+    
+    print(f"✅ EinsumDense test completed in {time.time() - start_time:.2f}s")
+
+
+def test_mixed_layer_types():
+    """Test model with mixed layer types including EinsumDense, Dense, and Embedding."""
+    print("🔧 Testing Mixed Layer Types")
+    print("=" * 50)
+    
+    start_time = time.time()
+    print(f"⏱️  {time.time() - start_time:.2f}s: Starting mixed layer test...")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating model with mixed layer types...")
+    
+    # Create a model with various layer types
+    inputs = keras.Input(shape=(10,))
+    
+    # Embedding layer
+    embedded = keras.layers.Embedding(input_dim=1000, output_dim=128)(inputs)
+    
+    # EinsumDense layer
+    einsum_output = keras.layers.EinsumDense(
+        equation="btd,de->bte",
+        output_shape=(10, 256),
+        bias_axes="e"
+    )(embedded)
+    
+    # Regular Dense layer
+    dense_output = keras.layers.Dense(128, activation='relu')(einsum_output)
+    
+    # Final Dense layer
+    final_output = keras.layers.Dense(10, activation='softmax')(dense_output)
+    
+    model = keras.Model(inputs=inputs, outputs=final_output)
+    
+    print(f"✅ {time.time() - start_time:.2f}s: Mixed layer model created with {model.count_params():,} parameters")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
+    
+    # Test tensor parallelism
+    tp_model = TensorParallelKeras(
+        model=model,
+        world_size=2,
+        distributed_backend='fallback'
+    )
+    
+    print(f"✅ {time.time() - start_time:.2f}s: Tensor parallel mixed layer model created successfully")
+    print(f"      Number of shards: {len(tp_model.model_shards)}")
+    print(f"      Devices: {tp_model.devices}")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Testing inference...")
+    
+    # Test inference
+    test_input = np.random.randint(0, 1000, (2, 10)).astype(np.int32)
+    
+    try:
+        original_output = model(test_input)
+        tp_output = tp_model(test_input)
+        
+        print(f"      Original output shape: {original_output.shape}")
+        print(f"      TP output shape: {tp_output.shape}")
+        
+        # Check batch sizes match
+        assert original_output.shape[0] == tp_output.shape[0], "Batch sizes don't match"
+        print(f"      ✅ Batch sizes match")
+        
+        # Check sequence lengths match
+        assert original_output.shape[1] == tp_output.shape[1], "Sequence lengths don't match"
+        print(f"      ✅ Sequence lengths match")
+        
+        # Check output dimensions match
+        assert original_output.shape[2] == tp_output.shape[2], "Output dimensions don't match"
+        print(f"      ✅ Output dimensions match")
+        
+        print(f"      ✅ Mixed layer tensor parallelism working correctly")
+        
+    except Exception as e:
+        print(f"      ❌ Inference failed: {e}")
+        raise
+    
+    print(f"✅ Mixed layer test completed in {time.time() - start_time:.2f}s") 

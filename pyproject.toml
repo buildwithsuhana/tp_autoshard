@@ -1,9 +1,23 @@
 [build-system]
-requires = [
-    "setuptools>=42",
-    "wheel"
-]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensor-parallel-keras"
+version = "0.1.0"
+description = "Tensor Parallelism for Keras 3.0"
+authors = [{name = "Tensor Parallel Keras Team"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "keras>=3.0.0",
+    "keras-nlp>=0.6.0",
+    "torch>=2.0.0",
+    "tensorflow>=2.13.0",
+    "jax>=0.4.0",
+    "numpy>=1.21.0",
+]
 
 [tool.black]
 line-length = 120

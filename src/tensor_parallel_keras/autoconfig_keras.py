@@ -12,13 +12,14 @@ from .config_keras import ConfigKeras
 from .state_actions_keras import SplitKeras, GatherKeras, SumKeras
 
 
-def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> ConfigKeras:
+def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_strategy: str = "auto") -> ConfigKeras:
     """
     Generate default tensor parallel configuration for Keras models.
     
     Args:
         module: Keras model to parallelize
         device_ids: List of device IDs to use
+        sharding_strategy: Sharding strategy - "auto", "row", "column", or "mixed"
         
     Returns:
         ConfigKeras object with sharding rules
@@ -37,18 +38,40 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
             
             # Handle Dense layers (equivalent to PyTorch Linear)
             if isinstance(layer, layers.Dense):
-                # Split weights along output dimension (dim=1)
-                state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=1)
+                # For now, we only support column-wise sharding (output feature splitting)
+                # Row-wise sharding requires complex input preprocessing that's not implemented yet
+                if sharding_strategy in ["row", "mixed"]:
+                    # Fall back to column-wise for unsupported strategies
+                    kernel_dim = 1
+                    bias_dim = 0
+                    effective_strategy = "column"
+                else:  # "auto" or "column"
+                    # Column-wise: Split output features (dim=1)
+                    kernel_dim = 1
+                    bias_dim = 0
+                    effective_strategy = "column"
+                
+                # Apply sharding rules
+                state_rules[f"^{full_name}.kernel$"] = SplitKeras(
+                    world_size=world_size, 
+                    dim=kernel_dim,
+                    sharding_type=effective_strategy
+                )
                 if layer.use_bias:
-                    # Bias is 1D, split along dimension 0
-                    state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size=world_size, dim=0)
+                    state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                        world_size=world_size, 
+                        dim=bias_dim,
+                        sharding_type="row" if bias_dim == 0 else "column"
+                    )
                 
                 # Output needs to be gathered
                 output_rules[f"^{full_name}$"] = {0: "gather -1"}
                 
             # Handle Embedding layers
             elif isinstance(layer, layers.Embedding):
-                # Split along embedding dimension (dim=1)
+                # Split along embedding dimension (dim=1 for Keras)
+                # Keras: embeddings shape is (input_dim, output_dim)
+                # We want to split output_dim (embedding dimension), so split along dim=1
                 state_rules[f"^{full_name}.embeddings$"] = SplitKeras(world_size=world_size, dim=1)
                 
                 # Output needs to be gathered
@@ -82,6 +105,17 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                 
                 # Output needs to be gathered
                 output_rules[f"^{full_name}$"] = {0: "gather -1"}
+                
+            # Handle LayerNormalization layers
+            elif isinstance(layer, layers.LayerNormalization):
+                # LayerNormalization needs to be aware of the sharded hidden size
+                # We'll handle this by ensuring the axis parameter is correct
+                pass
+                
+            # Handle other normalization layers
+            elif isinstance(layer, (layers.BatchNormalization, layers.GroupNormalization)):
+                # These layers need to be aware of the sharded dimensions
+                pass
                 
             # Recursively process submodules
             if hasattr(layer, 'layers') and len(layer.layers) > 0:

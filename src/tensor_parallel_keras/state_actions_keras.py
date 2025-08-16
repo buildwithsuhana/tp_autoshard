@@ -23,9 +23,17 @@ class StateActionKeras:
 class SplitKeras(StateActionKeras):
     """Split a tensor along a specified dimension."""
     
-    def __init__(self, world_size: int, dim: int):
+    def __init__(self, world_size: int, dim: int, sharding_type: str = "auto"):
         self.world_size = world_size
         self.dim = dim
+        self.sharding_type = sharding_type  # "auto", "row", "column"
+        
+        # Auto-determine dimension based on sharding type if dim is -1
+        if dim == -1 and sharding_type != "auto":
+            if sharding_type == "row":
+                self.dim = 0
+            elif sharding_type == "column":
+                self.dim = 1
         
     def __call__(self, tensor: torch.Tensor, rank: int) -> torch.Tensor:
         """Split tensor and return the portion for this rank."""

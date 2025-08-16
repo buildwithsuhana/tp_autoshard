@@ -191,19 +191,39 @@ def rebuild_model_with_sharded_layers(original_module: Model, config: ConfigKera
                         break
                 
                 if original_kernel is not None:
-                    # Apply sharding to get the new output size
+                    # Apply sharding to get the new dimensions
                     action = config.state_rules[kernel_pattern]
                     sharded_kernel = action(torch.tensor(original_kernel.numpy()), rank)
-                    new_output_size = sharded_kernel.shape[1]
                     
-                    # Create new Dense layer with sharded output size
-                    new_layer = layers.Dense(
-                        units=new_output_size,
-                        activation=layer.activation,
-                        use_bias=layer.use_bias,
-                        name=layer.name
-                    )
-                    x = new_layer(x)
+                    # Determine the new layer dimensions based on sharding type
+                    if action.sharding_type == "row":
+                        # Row-wise: Split input features, keep all output features
+                        new_input_size = sharded_kernel.shape[0]
+                        new_output_size = sharded_kernel.shape[1]
+                        
+                        # Create new Dense layer with sharded input size
+                        new_layer = layers.Dense(
+                            units=new_output_size,
+                            activation=layer.activation,
+                            use_bias=layer.use_bias,
+                            name=layer.name
+                        )
+                        # Note: We need to handle input reshaping for row-wise sharding
+                        # This is more complex and requires input preprocessing
+                        x = new_layer(x)
+                        
+                    else:  # column or auto
+                        # Column-wise: Split output features, keep all input features
+                        new_output_size = sharded_kernel.shape[1]
+                        
+                        # Create new Dense layer with sharded output size
+                        new_layer = layers.Dense(
+                            units=new_output_size,
+                            activation=layer.activation,
+                            use_bias=layer.use_bias,
+                            name=layer.name
+                        )
+                        x = new_layer(x)
                 else:
                     # Fallback to original layer
                     x = layer(x)
@@ -243,6 +263,21 @@ def rebuild_model_with_sharded_layers(original_module: Model, config: ConfigKera
             else:
                 # No sharding rule, use original layer
                 x = layer(x)
+                
+        elif isinstance(layer, layers.LayerNormalization):
+            # LayerNormalization needs to be updated to work with sharded dimensions
+            # The axis parameter should work with the current tensor shape
+            layer_name = layer.name
+            
+            # Create new LayerNormalization with the same parameters
+            new_layer = layers.LayerNormalization(
+                axis=layer.axis,
+                epsilon=layer.epsilon,
+                center=layer.center,
+                scale=layer.scale,
+                name=layer.name
+            )
+            x = new_layer(x)
                 
         else:
             # For other layer types, use as-is

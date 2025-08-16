@@ -36,6 +36,9 @@ class TensorParallel(nn.Module):
         sharded: bool = True,
         sharded_param_names: Optional[Collection[str]] = None,
     ):
+        print("="*50)
+        print("Amit - TensorParallel __init__ called!")
+        print("="*50)
         super().__init__()
         original_params = sum(p.numel() for p in module.parameters())
         assert output_device is None or output_device_index is None, "please specify either device or index, not both"

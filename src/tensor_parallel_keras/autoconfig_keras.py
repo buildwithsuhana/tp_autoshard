@@ -70,6 +70,76 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_
                 # Output needs to be gathered
                 output_rules[f"^{full_name}$"] = {0: "gather -1"}
                 
+            # Handle EinsumDense layers (common in transformer models like OPT)
+            elif isinstance(layer, layers.EinsumDense):
+                # EinsumDense has equation parameter
+                # We need to determine the sharding strategy based on the equation
+                equation = layer.equation
+                
+                # Common patterns for EinsumDense:
+                # - "btd,de->bte" (input projection): split output dimension 'e'
+                # - "bte,de->btd" (output projection): split input dimension 'e'
+                # - "btd,de->bte" (MLP): split output dimension 'e'
+                
+                # Default to column-wise sharding (split output dimension)
+                # This is the most common and safe approach for EinsumDense
+                state_rules[f"^{full_name}.kernel$"] = SplitKeras(
+                    world_size=world_size, 
+                    dim=1,  # Split along output dimension (dim=1)
+                    sharding_type="column"
+                )
+                
+                # Apply sharding to bias if it exists
+                if hasattr(layer, 'bias') and layer.bias is not None:
+                    state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                        world_size=world_size, 
+                        dim=0,
+                        sharding_type="row"
+                    )
+                
+                # Output needs to be gathered
+                output_rules[f"^{full_name}$"] = {0: "gather -1"}
+                
+                logger.info(f"Applied EinsumDense sharding to {full_name} with equation {equation}")
+                
+            # Handle TFDense layers (TensorFlow Dense equivalent)
+            elif hasattr(layer, '__class__') and 'Dense' in layer.__class__.__name__:
+                # Handle various Dense layer variants
+                # This catches TFDense, Dense, and other Dense-like layers
+                
+                # Check if it has kernel and bias attributes
+                if hasattr(layer, 'kernel') or hasattr(layer, 'weights'):
+                    # Determine the weight attribute name
+                    weight_attr = 'kernel' if hasattr(layer, 'kernel') else 'weights'
+                    
+                    # Apply sharding rules
+                    state_rules[f"^{full_name}.{weight_attr}$"] = SplitKeras(
+                        world_size=world_size, 
+                        dim=1,
+                        sharding_type="column"
+                    )
+                    
+                    # Handle bias if it exists
+                    if hasattr(layer, 'bias') and layer.bias is not None:
+                        state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                            world_size=world_size, 
+                            dim=0,
+                            sharding_type="row"
+                        )
+                    elif hasattr(layer, 'use_bias') and layer.use_bias:
+                        # Try to find bias in weights
+                        if hasattr(layer, 'weights') and len(layer.weights) > 1:
+                            state_rules[f"^{full_name}.weights.1$"] = SplitKeras(
+                                world_size=world_size, 
+                                dim=0,
+                                sharding_type="row"
+                            )
+                    
+                    # Output needs to be gathered
+                    output_rules[f"^{full_name}$"] = {0: "gather -1"}
+                    
+                    logger.info(f"Applied generic Dense sharding to {full_name}")
+                
             # Handle Embedding layers
             elif isinstance(layer, layers.Embedding):
                 # Split along embedding dimension (dim=1 for Keras)

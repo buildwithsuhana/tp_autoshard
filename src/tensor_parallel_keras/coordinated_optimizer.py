@@ -638,12 +638,34 @@ class TensorParallelOptimizer(optimizers.Optimizer):
                 lr = 0.001
         
         # Initialize parent optimizer with base optimizer's config
+        # Handle both string and optimizer object cases
+        if isinstance(base_optimizer, str):
+            optimizer_name = base_optimizer
+        else:
+            optimizer_name = getattr(base_optimizer, 'name', 'unknown')
+            
         super().__init__(
             learning_rate=lr,
-            name=f"TensorParallel_{base_optimizer.name}"
+            name=f"TensorParallel_{optimizer_name}"
         )
         
-        self.coordinated_optimizer = CoordinatedOptimizer(base_optimizer, world_size)
+        # Ensure base_optimizer is an actual optimizer object, not a string
+        if isinstance(base_optimizer, str):
+            # Convert string to optimizer object
+            if base_optimizer.lower() == 'adam':
+                actual_optimizer = optimizers.Adam(learning_rate=lr)
+            elif base_optimizer.lower() == 'sgd':
+                actual_optimizer = optimizers.SGD(learning_rate=lr)
+            elif base_optimizer.lower() == 'rmsprop':
+                actual_optimizer = optimizers.RMSprop(learning_rate=lr)
+            else:
+                # Fallback to Adam for unknown optimizers
+                actual_optimizer = optimizers.Adam(learning_rate=lr)
+            self.base_optimizer = actual_optimizer
+        else:
+            self.base_optimizer = base_optimizer
+            
+        self.coordinated_optimizer = CoordinatedOptimizer(self.base_optimizer, world_size)
         self.world_size = world_size
         self.base_optimizer = base_optimizer
     

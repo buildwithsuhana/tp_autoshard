@@ -93,7 +93,6 @@ class TensorParallelKeras(keras.Model):
         
         # Set default values for other parameters
 
-        self.delay_init = False  # Default to immediate initialization
         self.tensor_parallel_config = None  # Will be auto-generated
         self.distributed = True  # Enable distributed communication for multi-device scenarios
         
@@ -120,14 +119,13 @@ class TensorParallelKeras(keras.Model):
         # Store device information
         self.devices = device_ids
         self.device_ids = [self._get_device_index(x) for x in device_ids]
-        self.need_delayed_init = self.delay_init
         self.world_size = world_size
         self.sharding_manager = None
         
         # Handle single device case
         if len(device_ids) <= 1:
             self.model_shards = [model]
-            if len(device_ids) == 1 and not self.delay_init:
+            if len(device_ids) == 1:
                 # Move model to specified device
                 with device(device_ids[0]):
                     self.model_shards[0] = model
@@ -148,9 +146,6 @@ class TensorParallelKeras(keras.Model):
         # Create model shards using parameter-level sharding
         print(f"🔧 Creating model shards for {model.name}")
         for rank, device_id in enumerate(self.devices):
-            if self.delay_init:
-                device_id = "cpu"
-                
             shard, modified_parameters_names = make_parameter_sharded_model(
                 model, config_with_ops, rank=rank, world_size=self.world_size
             )

@@ -4,9 +4,6 @@ Port of the PyTorch tensor_parallel library
 """
 
 import logging
-import threading
-from contextlib import nullcontext
-from operator import attrgetter
 from typing import Any, Collection, Optional, Sequence, Union
 
 import numpy as np
@@ -18,14 +15,10 @@ from keras import device
 
 from .autoconfig_keras import get_default_config_keras
 from .config_keras import ConfigKeras
-from .shard_keras import make_shard_keras
-from .parameter_sharding import make_parameter_sharded_model, apply_parameter_sharding_to_existing_model
+from .parameter_sharding import make_parameter_sharded_model
 from .sharding_keras import ShardedKeras
-from .utils_keras import nested_flatten, nested_pack
-from .communications_keras import allreduce_gradients, allgather_outputs, broadcast_parameters
+from .communications_keras import allgather_outputs
 from .coordinated_optimizer import TensorParallelOptimizer
-from .distributed_backend import DistributedBackend
-from .config_keras import ConfigKeras
 
 logger = logging.getLogger(__file__)
 

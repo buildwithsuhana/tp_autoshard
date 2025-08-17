@@ -27,45 +27,65 @@ def analyze_dense_layer_directly(layer: layers.Dense, module: Model, prefix: str
         String indicating the layer type: 'up_projection', 'down_projection', or 'generic_dense'
     """
     
-    # Get layer dimensions
-    input_shape = getattr(layer, 'input_shape', None)
-    output_shape = getattr(layer, 'output_shape', None)
-    
-    if not input_shape or not output_shape:
+    # Safety check: ensure this is actually a Dense layer
+    if not isinstance(layer, layers.Dense):
         return 'generic_dense'
     
-    input_dim = input_shape[-1] if input_shape else None
-    output_dim = output_shape[-1] if output_shape else None
+    # Get layer dimensions from the units attribute
+    output_dim = layer.units if hasattr(layer, 'units') else None
     
-    if not input_dim or not output_dim:
+    if not output_dim:
+        return 'generic_dense'
+    
+    # Find the previous layer to get input dimension
+    prev_layer = None
+    for i, l in enumerate(module.layers):
+        if l.name == layer.name:
+            if i > 0:
+                prev_layer = module.layers[i-1]
+            break
+    
+    # Check if the previous layer is actually a Dense layer (not InputLayer, etc.)
+    if prev_layer and not isinstance(prev_layer, layers.Dense):
+        prev_layer = None
+    
+    if not prev_layer:
+        # This is the first layer - check if it's an up-projection by looking at the model's input shape
+        if hasattr(module, 'input_shape') and module.input_shape and len(module.input_shape) > 1:
+            input_dim = module.input_shape[-1]
+            if input_dim is not None:  # Safety check for None
+                # If output is significantly larger than input, it's likely an up-projection
+                expansion_check = output_dim > input_dim * 1.5
+                if expansion_check:
+                    return 'up_projection'
+        # If we reach here, it's not an up-projection
+        return 'generic_dense'
+    
+    # Get input dimension from previous layer
+    input_dim = None
+    if hasattr(prev_layer, 'units'):
+        input_dim = prev_layer.units
+    elif hasattr(prev_layer, 'output_shape') and prev_layer.output_shape:
+        input_dim = prev_layer.output_shape[-1]
+    
+    if not input_dim:
         return 'generic_dense'
     
     # Check expansion/contraction patterns
-    expansion_threshold = 2.0
+    expansion_threshold = 1.5  # Lower threshold for better detection
     is_expansion = output_dim > input_dim * expansion_threshold
     is_contraction = input_dim > output_dim * expansion_threshold
     
-    # Find connected Dense layers in the same module for context
-    connected_dense_count = count_connected_dense_layers(module)
-    
     # Analyze the pattern
-    if is_expansion and connected_dense_count >= 1:
+    if is_expansion:
         return 'up_projection'
-    elif is_contraction and connected_dense_count >= 1:
+    elif is_contraction:
         return 'down_projection'
     else:
         return 'generic_dense'
 
 
-def count_connected_dense_layers(module: Model) -> int:
-    """
-    Count the number of Dense layers in the module for context analysis.
-    """
-    dense_count = 0
-    for layer in module.layers:
-        if isinstance(layer, layers.Dense):
-            dense_count += 1
-    return dense_count
+
 
 
 def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> ConfigKeras:
@@ -104,12 +124,12 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                     if layer.use_bias:
                         state_rules[f"^{full_name}.bias$"] = SplitKeras(
                             world_size=world_size, 
-                            dim=0,
-                            sharding_type="row"
+                            dim=0,  # Split bias along output dimension (bias is 1D)
+                            sharding_type="column"
                         )
                     
-                    # Output is distributed (no communication needed)
-                    output_rules[f"^{full_name}$"] = {0: "no_comm"}
+                    # Output needs to be gathered for the next layer (handshake)
+                    output_rules[f"^{full_name}$"] = {0: "gather"}
                     
                     logger.info(f"Applied Column-wise sharding to MLP up-projection {full_name} (direct-analysis)")
                 
@@ -231,8 +251,10 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                 # We want to split output_dim (embedding dimension), so split along dim=1
                 state_rules[f"^{full_name}.embeddings$"] = SplitKeras(world_size=world_size, dim=1)
                 
-                # Output needs to be gathered
-                output_rules[f"^{full_name}$"] = {0: "gather -1"}
+                # Output is distributed (no communication needed) - use first shard output
+                output_rules[f"^{full_name}$"] = {0: "no_comm"}
+                
+                logger.info(f"Applied Embedding sharding to {full_name}")
                 
             # Handle Attention layers with Column -> Row pattern
             elif isinstance(layer, layers.MultiHeadAttention):

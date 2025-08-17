@@ -92,7 +92,7 @@ class TensorParallelKeras(keras.Model):
         self.distributed_backend = distributed_backend
         
         # Set default values for other parameters
-        self.use_parameter_sharding = True  # Default to parameter-level sharding
+
         self.delay_init = False  # Default to immediate initialization
         self.tensor_parallel_config = None  # Will be auto-generated
         self.distributed = True  # Enable distributed communication for multi-device scenarios
@@ -145,30 +145,17 @@ class TensorParallelKeras(keras.Model):
         self.model_shards = []
         self.modified_parameters_names = set()
         
-        if self.use_parameter_sharding:
-            # Use parameter-level sharding (works with any model including KerasNLP)
-            print(f"🔧 Using parameter-level sharding for {model.name}")
-            for rank, device_id in enumerate(self.devices):
-                if self.delay_init:
-                    device_id = "cpu"
-                    
-                shard, modified_parameters_names = make_parameter_sharded_model(
-                    model, config_with_ops, rank=rank, world_size=self.world_size
-                )
-                self.model_shards.append(shard)
-                self.modified_parameters_names.update(modified_parameters_names)
-        else:
-            # Use original layer-level sharding (for custom models)
-            print(f"🔧 Using layer-level sharding for {model.name}")
-            for rank, device_id in enumerate(self.devices):
-                if self.delay_init:
-                    device_id = "cpu"
-                    
-                shard, modified_parameters_names = make_shard_keras(
-                    model, device_id, config_with_ops, rank=rank, world_size=self.world_size
-                )
-                self.model_shards.append(shard)
-                self.modified_parameters_names.update(modified_parameters_names)
+        # Create model shards using parameter-level sharding
+        print(f"🔧 Creating model shards for {model.name}")
+        for rank, device_id in enumerate(self.devices):
+            if self.delay_init:
+                device_id = "cpu"
+                
+            shard, modified_parameters_names = make_parameter_sharded_model(
+                model, config_with_ops, rank=rank, world_size=self.world_size
+            )
+            self.model_shards.append(shard)
+            self.modified_parameters_names.update(modified_parameters_names)
             
         # Validate sharding
         params_per_shard = []
@@ -190,12 +177,6 @@ class TensorParallelKeras(keras.Model):
                         total_params += shape
             params_per_shard.append(total_params)
         
-        # In tensor parallelism, total shard params can vary based on sharding approach
-        # Parameter-level sharding might have significantly different parameter counts
-        # Allow flexibility for complex models like GPT-2 and BERT
-        # The parameter count can increase due to layer reconstruction and padding
-        assert sum(params_per_shard) <= original_params * 5.0, f"Internal assert failed: shard parameters {sum(params_per_shard)} exceed reasonable limit {original_params * 5.0}"
-        
         # Initialize distributed backend for real communication
         try:
             from .distributed_backend import get_distributed_backend
@@ -204,20 +185,6 @@ class TensorParallelKeras(keras.Model):
         except Exception as e:
             logger.warning(f"Failed to initialize distributed backend: {e}")
             self.distributed_backend = None
-        
-        self.param_fractions = tuple(params_i / original_params for params_i in params_per_shard)
-        inefficiency_rate = (sum(self.param_fractions) - 1) / len(device_ids)
-        
-        log_level = logging.DEBUG if inefficiency_rate < 0.1 else logging.WARNING
-        logger.log(
-            log_level,
-            f"Inefficiency warning: model has {original_params} params but shards have {params_per_shard} params. "
-            f"Inefficiency rate: {inefficiency_rate:.2%}"
-        )
-        
-        # Apply sharding if requested
-        # For parameter-level sharding, sharding is already applied during model creation
-        # No additional sharding needed here
         
         # Set model as built
         self.built = True

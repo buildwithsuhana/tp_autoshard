@@ -61,13 +61,32 @@ def test_bert_tiny_model():
     tp_output = tp_bert(test_input)
     
     print(f"      Original output shape: {original_output['sequence_output'].shape}")
-    print(f"      TP output shape: {tp_output.shape}")
+    
+    # Handle different output formats from tensor parallel model
+    if hasattr(tp_output, 'shape'):
+        # Direct tensor output
+        print(f"      TP output shape: {tp_output.shape}")
+        tp_sequence_output = tp_output
+    elif isinstance(tp_output, dict) and 'sequence_output' in tp_output:
+        # Dictionary output with sequence_output key
+        print(f"      TP output shape: {tp_output['sequence_output'].shape}")
+        tp_sequence_output = tp_output['sequence_output']
+    else:
+        # Try to get the first element if it's a list/tuple
+        print(f"      TP output type: {type(tp_output)}")
+        if isinstance(tp_output, (list, tuple)) and len(tp_output) > 0:
+            tp_sequence_output = tp_output[0]
+            print(f"      TP output[0] shape: {tp_sequence_output.shape}")
+        else:
+            # Fallback: try to access as attribute
+            tp_sequence_output = tp_output
+            print(f"      TP output (fallback): {tp_output}")
     
     # Check batch sizes match
-    assert original_output['sequence_output'].shape[0] == tp_output.shape[0], "Batch sizes don't match"
+    assert original_output['sequence_output'].shape[0] == tp_sequence_output.shape[0], "Batch sizes don't match"
     print(f"      ✅ Batch sizes match")
     
-    if original_output['sequence_output'].shape != tp_output.shape:
+    if original_output['sequence_output'].shape != tp_sequence_output.shape:
         print(f"      ⚠️  Output shapes differ (expected in tensor parallelism)")
     
     print(f"      ✅ Tensor parallelism working correctly")

@@ -18,16 +18,13 @@ class ConfigKeras:
     Configuration for Keras tensor parallel operations.
     """
     state_rules: Dict[str, Any]  # How to split parameters
-    input_rules: Dict[str, Any]  # How to handle inputs  
     output_rules: Dict[str, Any] # How to handle outputs
-    attr_rules: Dict[str, Any]   # How to handle attributes
     
     def create_collective_ops(self, devices: Sequence[str], distributed: bool = True):
         """
         Create collective operations for the configuration.
         """
         world_size = len(devices)
-        all_cuda = all(device.startswith("gpu") for device in devices)
         
         # Use new communication operations
         make_allreduce = lambda ws: AllReduceKeras(ws, op="mean")
@@ -63,6 +60,5 @@ class ConfigKeras:
         # Create a copy with collective operations
         return dataclasses.replace(
             self,
-            input_rules=create_collective_ops(self.input_rules),
             output_rules=create_collective_ops(self.output_rules),
         ) 

@@ -30,37 +30,72 @@ from .config_keras import ConfigKeras
 logger = logging.getLogger(__file__)
 
 
-class TensorParallelKeras(Model):
+class TensorParallelKeras(keras.Model):
     """
-    Tensor Parallel wrapper for Keras models.
-    Distributes model parameters across multiple devices for parallel computation.
+    Tensor Parallel implementation for Keras models.
+    
+    This class automatically distributes model parameters across multiple devices
+    for parallel computation. It inherits from keras.Model to provide full
+    Keras compatibility including training, evaluation, and serialization.
+    
+    Key Features:
+    - Automatic device detection (CPU, GPU, TPU)
+    - Smart parameter sharding strategy (always "auto" - the optimal choice)
+    - Support for all Keras layer types including EinsumDense
+    - Real distributed communication with graceful fallbacks
+    - Full Keras Model compatibility
+    
+    Args:
+        model: Keras model to parallelize
+        world_size: Number of parallel processes. If None, auto-detected from devices
+        device_ids: List of device IDs to use. If None, auto-detected
+        distributed_backend: Distributed backend to use ("auto", "jax", "pytorch", "tensorflow", "horovod", "nccl", "fallback")
+    
+    Example:
+        # Simple usage with auto-detection
+        tp_model = TensorParallelKeras(model)
+        
+        # Explicit configuration
+        tp_model = TensorParallelKeras(model, world_size=4, device_ids=['gpu:0', 'gpu:1', 'gpu:2', 'gpu:3'])
+        
+        # Use like any Keras model
+        tp_model.compile(optimizer='adam', loss='categorical_crossentropy')
+        tp_model.fit(x_train, y_train, epochs=10)
     """
     
-    def __init__(
-        self,
-        model,
-        device_ids: Optional[Sequence[str]] = None,
-        output_device: Optional[str] = None,
-        output_device_index: Optional[int] = None,
-        tensor_parallel_config: Optional[ConfigKeras] = None,
-        distributed: Optional[DistributedBackend] = None,
-        delay_init: bool = False,
-        sharding_strategy: str = 'auto',
-        distributed_backend: str = 'auto',
-        rank: int = 0,
-        use_parameter_sharding: bool = True,  # New parameter for KerasNLP compatibility
-        **kwargs
-    ):
-        print("="*50)
+    def __init__(self, model, world_size=None, device_ids=None, distributed_backend="auto", **kwargs):
+        """
+        Initialize TensorParallelKeras.
+        
+        Args:
+            model: Keras model to parallelize
+            world_size: Number of parallel processes. If None, auto-detected from devices
+            device_ids: List of device IDs to use. If None, auto-detected
+            distributed_backend: Distributed backend to use ("auto", "jax", "pytorch", "tensorflow", "horovod", "nccl", "fallback")
+        """
+        super().__init__()
+        
+        print("=" * 50)
         print("Amit - TensorParallelKeras __init__ called!")
-        print("="*50)
+        print("=" * 50)
         
-        # Extract parameters that should not be passed to super().__init__
-        world_size = kwargs.pop('world_size', None)
+        # Auto-detect world_size and device_ids if not provided
+        if world_size is None:
+            world_size, device_ids = self._auto_detect_parallelism()
+        elif device_ids is None:
+            # Only auto-detect device_ids if world_size is specified
+            device_ids = self._auto_configure_devices(world_size, distributed_backend)
         
-        # Store sharding strategy and approach
-        self.sharding_strategy = sharding_strategy
-        self.use_parameter_sharding = use_parameter_sharding
+        self.world_size = world_size
+        self.device_ids = device_ids
+        self.sharding_strategy = "auto"  # Always use auto - it's the smartest choice!
+        self.distributed_backend = distributed_backend
+        
+        # Set default values for other parameters
+        self.use_parameter_sharding = True  # Default to parameter-level sharding
+        self.delay_init = False  # Default to immediate initialization
+        self.tensor_parallel_config = None  # Will be auto-generated
+        self.distributed = True  # Enable distributed communication for multi-device scenarios
         
         # Initialize the Keras Model parent class
         super().__init__(**kwargs)
@@ -71,83 +106,40 @@ class TensorParallelKeras(Model):
         # Calculate original parameter count
         original_params = sum(p.shape.num_elements() for p in model.weights)
         
-        # Validate output device specification
-        assert output_device is None or output_device_index is None, "please specify either device or index, not both"
-        
         # Process device IDs
         device_ids = list(self.check_device_ids(device_ids))  # Convert to list for modification
         
         # If no device IDs specified, use auto-configuration
         if not device_ids:
-            try:
-                from .distribution_lib import auto_configure_tensor_parallel
-                auto_config = auto_configure_tensor_parallel(world_size)
-                
-                if auto_config['auto_configured']:
-                    device_ids = auto_config['devices']
-                    if distributed_backend == 'auto':
-                        distributed_backend = auto_config['backend']
-                    logger.info(f"Auto-configured devices: {device_ids}")
-                    logger.info(f"Auto-configured backend: {distributed_backend}")
-                else:
-                    logger.warning(f"Auto-configuration failed: {auto_config.get('error', 'Unknown error')}")
-                    # Fallback to default CPU
-                    device_ids = ['cpu:0']
-            except ImportError:
-                logger.warning("distribution_lib not available, using default CPU")
-                device_ids = ['cpu:0']
+            device_ids = self._auto_configure_devices(world_size, distributed_backend)
             
-        # Handle output device
-        if output_device is not None:
-            output_device = self.canonicalize_device(output_device)
-            assert output_device in device_ids, f"Output device {output_device} not in {device_ids}"
-            output_device_index = device_ids.index(output_device)
-            del output_device
-        elif output_device_index is None:
-            output_device_index = 0
+        # Ensure device_ids match world_size
+        if len(device_ids) != world_size:
+            device_ids = self._adjust_device_list(device_ids, world_size)
             
         # Store device information
         self.devices = device_ids
-        self.output_device_index = output_device_index
-        self.all_cuda = all(device.startswith("gpu") for device in self.devices)
         self.device_ids = [self._get_device_index(x) for x in device_ids]
-        self.need_delayed_init = delay_init
-        self.world_size = len(self.devices)
+        self.need_delayed_init = self.delay_init
+        self.world_size = world_size
         self.sharding_manager = None
         
-        # Override world_size if explicitly provided
-        if world_size is not None:
-            self.world_size = world_size
-            # Adjust device_ids to match world_size
-            if len(device_ids) != world_size:
-                # Create new device list with the specified world_size
-                if len(device_ids) < world_size:
-                    # Extend with additional devices
-                    for i in range(len(device_ids), world_size):
-                        device_ids.append(f"cpu:{i}")
-                else:
-                    # Truncate to world_size
-                    device_ids = device_ids[:world_size]
-                self.devices = device_ids
-            
         # Handle single device case
         if len(device_ids) <= 1:
             self.model_shards = [model]
-            if len(device_ids) == 1 and not delay_init:
+            if len(device_ids) == 1 and not self.delay_init:
                 # Move model to specified device
                 with device(device_ids[0]):
                     self.model_shards[0] = model
             return
             
         # Get tensor parallel configuration
-        if tensor_parallel_config is None:
-            tensor_parallel_config = get_default_config_keras(model, self.devices, self.sharding_strategy)
-            logger.info(f"Using automatic config with {self.sharding_strategy} sharding strategy: sharding individual Dense/Conv/Embedding layers")
-            
-        self.tensor_parallel_config = tensor_parallel_config
+        if self.tensor_parallel_config is None:
+            self.tensor_parallel_config = get_default_config_keras(model, self.devices)
+            logger.info(f"Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers")
         
         # Create collective operations
-        config_with_ops = tensor_parallel_config.create_collective_ops(self.devices, distributed)
+        config_with_ops = self.tensor_parallel_config.create_collective_ops(self.devices, self.distributed)
         
         # Create model shards
         self.model_shards = []
@@ -157,7 +149,7 @@ class TensorParallelKeras(Model):
             # Use parameter-level sharding (works with any model including KerasNLP)
             print(f"🔧 Using parameter-level sharding for {model.name}")
             for rank, device_id in enumerate(self.devices):
-                if delay_init:
+                if self.delay_init:
                     device_id = "cpu"
                     
                 shard, modified_parameters_names = make_parameter_sharded_model(
@@ -169,7 +161,7 @@ class TensorParallelKeras(Model):
             # Use original layer-level sharding (for custom models)
             print(f"🔧 Using layer-level sharding for {model.name}")
             for rank, device_id in enumerate(self.devices):
-                if delay_init:
+                if self.delay_init:
                     device_id = "cpu"
                     
                 shard, modified_parameters_names = make_shard_keras(
@@ -198,33 +190,20 @@ class TensorParallelKeras(Model):
                         total_params += shape
             params_per_shard.append(total_params)
         
-        # In tensor parallelism, total shard params can vary based on sharding strategy
-        # Row-wise sharding might increase params due to layer reconstruction
-        # Column-wise sharding typically reduces params
-        if self.sharding_strategy == "row":
-            # Row-wise sharding might increase parameters due to layer reconstruction
-            # Allow some flexibility in parameter count
-            assert sum(params_per_shard) <= original_params * 1.5, f"Internal assert failed: shard parameters {sum(params_per_shard)} exceed reasonable limit {original_params * 1.5}"
-            
+        # In tensor parallelism, total shard params can vary based on sharding approach
+        # Parameter-level sharding might have significantly different parameter counts
+        # Allow flexibility for complex models like GPT-2 and BERT
+        # The parameter count can increase due to layer reconstruction and padding
+        assert sum(params_per_shard) <= original_params * 5.0, f"Internal assert failed: shard parameters {sum(params_per_shard)} exceed reasonable limit {original_params * 5.0}"
+        
         # Initialize distributed backend for real communication
         try:
             from .distributed_backend import get_distributed_backend
-            self.distributed_backend = get_distributed_backend(distributed_backend, self.world_size, rank)
+            self.distributed_backend = get_distributed_backend(distributed_backend, self.world_size, rank=0)
             logger.info(f"Initialized distributed backend: {type(self.distributed_backend).__name__}")
         except Exception as e:
             logger.warning(f"Failed to initialize distributed backend: {e}")
             self.distributed_backend = None
-        else:
-            # For parameter-level sharding, allow some flexibility in parameter count
-            # as we're only sharding weights, not rebuilding layers
-            if hasattr(self, 'use_parameter_sharding') and self.use_parameter_sharding:
-                # Parameter-level sharding might have significantly different parameter counts
-                # Allow much more flexibility for complex models like GPT-2 and BERT
-                # The parameter count can increase due to layer reconstruction and padding
-                assert sum(params_per_shard) <= original_params * 5.0, f"Internal assert failed: shard parameters {sum(params_per_shard)} exceed reasonable limit {original_params * 5.0}"
-            else:
-                # Column-wise and other strategies should reduce parameters
-                assert sum(params_per_shard) <= original_params, "Internal assert failed: shard parameters exceed original"
         
         self.param_fractions = tuple(params_i / original_params for params_i in params_per_shard)
         inefficiency_rate = (sum(self.param_fractions) - 1) / len(device_ids)
@@ -242,6 +221,82 @@ class TensorParallelKeras(Model):
         
         # Set model as built
         self.built = True
+        
+    def _auto_detect_parallelism(self):
+        """Auto-detect world_size and device_ids efficiently."""
+        try:
+            from .distribution_lib import list_devices, get_best_devices
+            
+            # Get available devices first
+            available_devices = list_devices()
+            world_size = len(available_devices)
+            print(f"🔍 Auto-detected world_size: {world_size} from {len(available_devices)} available devices")
+            
+            # Get best devices for the detected world_size
+            device_ids = get_best_devices(world_size)
+            print(f"🔍 Auto-detected device_ids: {device_ids}")
+            
+            return world_size, device_ids
+            
+        except Exception as e:
+            print(f"⚠️  Auto-detection failed: {e}")
+            # Fallback to single CPU
+            world_size = 1
+            device_ids = ['cpu:0']
+            print(f"   Using fallback: world_size={world_size}, device_ids={device_ids}")
+            return world_size, device_ids
+        
+    def _adjust_device_list(self, device_ids, target_world_size):
+        """Adjust device list to match target world_size intelligently."""
+        current_size = len(device_ids)
+        
+        if current_size < target_world_size:
+            # Extend with additional devices of the same type
+            if device_ids:
+                # Use the same device type as existing devices
+                base_device = device_ids[0]
+                if ':' in base_device:
+                    device_type, base_index = base_device.rsplit(':', 1)
+                    try:
+                        base_index = int(base_index)
+                        additional_devices = [f"{device_type}:{base_index + i + 1}" for i in range(target_world_size - current_size)]
+                        return device_ids + additional_devices
+                    except ValueError:
+                        # Fallback to CPU if device format is unexpected
+                        additional_devices = [f"cpu:{i}" for i in range(current_size, target_world_size)]
+                        return device_ids + additional_devices
+                else:
+                    # Device without index, use CPU fallback
+                    additional_devices = [f"cpu:{i}" for i in range(current_size, target_world_size)]
+                    return device_ids + additional_devices
+            else:
+                # No existing devices, use CPU
+                return [f"cpu:{i}" for i in range(target_world_size)]
+        elif current_size > target_world_size:
+            # Truncate to target size
+            return device_ids[:target_world_size]
+        else:
+            # Already correct size
+            return device_ids
+        
+    def _auto_configure_devices(self, world_size, distributed_backend):
+        """Auto-configure devices - simplified version."""
+        try:
+            from .distribution_lib import list_devices
+            available_devices = list_devices()
+            
+            if available_devices:
+                # Use available devices up to world_size
+                devices = available_devices[:world_size]
+                logger.info(f"Auto-configured devices: {devices}")
+                return devices
+            else:
+                logger.warning("No devices available, using default CPU")
+                return ['cpu:0']
+                
+        except Exception as e:
+            logger.warning(f"Device detection failed: {e}, using default CPU")
+            return ['cpu:0']
         
     def check_device_ids(self, device_ids: Optional[Sequence[str]]) -> Sequence[str]:
         """Validate and normalize device IDs for Keras."""
@@ -347,7 +402,7 @@ class TensorParallelKeras(Model):
             replicated_param_names,
             self.tensor_parallel_config,
             self.devices,
-            self.output_device_index
+            0  # Use first device index
         )
         
     def call(self, inputs, training=None, **kwargs):
@@ -453,7 +508,7 @@ class TensorParallelKeras(Model):
                 
         except Exception as e:
             logger.warning(f"Error in output gathering: {e}, returning partial output")
-            return outputs[self.output_device_index]
+            return outputs[0]  # Use first device output
     
     def _synchronize_gradients(self):
         """Synchronize gradients across all shards using AllReduce."""
@@ -765,7 +820,45 @@ class TensorParallelKeras(Model):
         config.update({
             "model": self.original_model,
             "device_ids": self.devices,
-            "output_device_index": self.output_device_index,
+            "output_device_index": 0,  # Use first device index
             "sharded": hasattr(self, 'sharding_manager') and self.sharding_manager is not None
         })
         return config 
+
+    def auto_detect_parallelism(self):
+        """Automatically detect optimal parallelism settings."""
+        try:
+            from .distribution_lib import list_devices, get_best_devices
+            
+            # Get all available devices
+            all_devices = list_devices()
+            print(f"🔍 Available devices: {all_devices}")
+            
+            # Update world_size based on available devices
+            optimal_world_size = len(all_devices)
+            if optimal_world_size != self.world_size:
+                print(f"🔄 Updating world_size from {self.world_size} to {optimal_world_size}")
+                self.world_size = optimal_world_size
+            
+            # Update device_ids to use best available devices
+            optimal_devices = get_best_devices(self.world_size)
+            if optimal_devices != self.device_ids:
+                print(f"🔄 Updating device_ids from {self.device_ids} to {optimal_devices}")
+                self.device_ids = optimal_devices
+            
+            print(f"✅ Auto-detection complete: world_size={self.world_size}, devices={self.device_ids}")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  Auto-detection failed: {e}")
+            return False
+    
+    def get_parallelism_info(self):
+        """Get current parallelism configuration information."""
+        return {
+            'world_size': self.world_size,
+            'device_ids': self.device_ids,
+            'sharding_strategy': 'auto',  # Always auto - the smartest choice!
+            'distributed_backend': self.distributed_backend,
+            'is_auto_detected': hasattr(self, '_auto_detected') and self._auto_detected
+        } 

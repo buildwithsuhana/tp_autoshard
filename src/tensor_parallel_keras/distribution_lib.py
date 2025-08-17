@@ -196,18 +196,19 @@ def get_device_memory_info(device_id: str) -> Optional[Dict[str, any]]:
     
     return None 
 
-def auto_configure_tensor_parallel(world_size: int = None) -> Dict[str, any]:
+def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) -> Dict[str, any]:
     """
-    Automatically configure tensor parallelism with the best available devices and backend.
+    Automatically configure tensor parallelism with the best available devices.
     
     Args:
         world_size: Number of devices to use (if None, uses all available)
+        backend: Backend to use (if None, uses 'auto')
         
     Returns:
         Configuration dictionary with devices, backend, and other settings
     """
     try:
-        from .distribution_lib import list_devices, get_device_info, get_device_backend
+        from .distribution_lib import list_devices, get_device_info
         
         # Get all available devices
         all_devices = list_devices()
@@ -224,28 +225,21 @@ def auto_configure_tensor_parallel(world_size: int = None) -> Dict[str, any]:
         # Select the best devices
         selected_devices = all_devices[:world_size]
         
-        # Determine the best backend based on device types
+        # Get device types for information
         device_types = set()
         for device_id in selected_devices:
             device_info = get_device_info(device_id)
             device_type = device_info.get('type', '').lower()
             device_types.add(device_type)
         
-        # Choose backend based on device types
-        if 'tpu' in device_types:
-            recommended_backend = 'jax'
-        elif 'gpu' in device_types:
-            recommended_backend = 'nccl'
-        else:
-            recommended_backend = 'tensorflow'
+        # Use specified backend or default to 'auto'
+        recommended_backend = backend if backend else 'auto'
         
         # Create configuration
         config = {
             'devices': selected_devices,
             'world_size': world_size,
-            'backend': recommended_backend,
-            'device_types': list(device_types),
-            'auto_configured': True
+            'backend': recommended_backend
         }
         
         logger.info(f"Auto-configured tensor parallelism: {config}")
@@ -257,8 +251,5 @@ def auto_configure_tensor_parallel(world_size: int = None) -> Dict[str, any]:
         return {
             'devices': ['cpu:0'],
             'world_size': 1,
-            'backend': 'fallback',
-            'device_types': ['cpu'],
-            'auto_configured': False,
-            'error': str(e)
+            'backend': backend if backend else 'fallback'
         } 

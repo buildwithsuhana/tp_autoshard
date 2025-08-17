@@ -2,36 +2,86 @@
 Automatic configuration for Keras Tensor Parallel
 """
 
-import re
 import logging
-from typing import Dict, Sequence, Union
+from typing import Dict, Any, Sequence, List, Tuple, Optional
+from keras import Model, layers
 
 import torch
-from keras import layers, Model
-
 from .config_keras import ConfigKeras
 from .state_actions_keras import SplitKeras, GatherKeras, SumKeras
 
 logger = logging.getLogger(__name__)
 
 
-def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_strategy: str = "auto") -> ConfigKeras:
+def analyze_dense_layer_directly(layer: layers.Dense, module: Model, prefix: str) -> str:
     """
-    Generate default tensor parallel configuration for Keras models.
+    Analyze a Dense layer directly to determine its MLP role.
+    No name lookups - pure structural analysis.
     
     Args:
-        module: Keras model to parallelize
-        device_ids: List of device IDs to use
-        sharding_strategy: Sharding strategy - "auto", "row", "column", or "mixed"
+        layer: The Dense layer to analyze
+        module: The parent module containing the layer
+        prefix: Current layer name prefix for context
+        
+    Returns:
+        String indicating the layer type: 'up_projection', 'down_projection', or 'generic_dense'
+    """
+    
+    # Get layer dimensions
+    input_shape = getattr(layer, 'input_shape', None)
+    output_shape = getattr(layer, 'output_shape', None)
+    
+    if not input_shape or not output_shape:
+        return 'generic_dense'
+    
+    input_dim = input_shape[-1] if input_shape else None
+    output_dim = output_shape[-1] if output_shape else None
+    
+    if not input_dim or not output_dim:
+        return 'generic_dense'
+    
+    # Check expansion/contraction patterns
+    expansion_threshold = 2.0
+    is_expansion = output_dim > input_dim * expansion_threshold
+    is_contraction = input_dim > output_dim * expansion_threshold
+    
+    # Find connected Dense layers in the same module for context
+    connected_dense_count = count_connected_dense_layers(module)
+    
+    # Analyze the pattern
+    if is_expansion and connected_dense_count >= 1:
+        return 'up_projection'
+    elif is_contraction and connected_dense_count >= 1:
+        return 'down_projection'
+    else:
+        return 'generic_dense'
+
+
+def count_connected_dense_layers(module: Model) -> int:
+    """
+    Count the number of Dense layers in the module for context analysis.
+    """
+    dense_count = 0
+    for layer in module.layers:
+        if isinstance(layer, layers.Dense):
+            dense_count += 1
+    return dense_count
+
+
+def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> ConfigKeras:
+    """
+    Get default configuration for Keras tensor parallel.
+    
+    Args:
+        module: Keras model to analyze
+        device_ids: List of device IDs for sharding
         
     Returns:
         ConfigKeras object with sharding rules
     """
     world_size = len(device_ids)
     state_rules = {}
-    input_rules = {}
     output_rules = {}
-    attr_rules = {}
     
     # Recursively process all layers
     def process_module(module: Model, prefix: str = ""):
@@ -41,34 +91,68 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_
             
             # Handle Dense layers (equivalent to PyTorch Linear)
             if isinstance(layer, layers.Dense):
-                # For now, we only support column-wise sharding (output feature splitting)
-                # Row-wise sharding requires complex input preprocessing that's not implemented yet
-                if sharding_strategy in ["row", "mixed"]:
-                    # Fall back to column-wise for unsupported strategies
-                    kernel_dim = 1
-                    bias_dim = 0
-                    effective_strategy = "column"
-                else:  # "auto" or "column"
-                    # Column-wise: Split output features (dim=1)
-                    kernel_dim = 1
-                    bias_dim = 0
-                    effective_strategy = "column"
+                # Analyze the layer directly to determine its MLP role
+                mlp_type = analyze_dense_layer_directly(layer, module, full_name)
                 
-                # Apply sharding rules
-                state_rules[f"^{full_name}.kernel$"] = SplitKeras(
-                    world_size=world_size, 
-                    dim=kernel_dim,
-                    sharding_type=effective_strategy
-                )
-                if layer.use_bias:
-                    state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                if mlp_type == 'up_projection':
+                    # Column-wise sharding: split output dimension
+                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(
                         world_size=world_size, 
-                        dim=bias_dim,
-                        sharding_type="row" if bias_dim == 0 else "column"
+                        dim=1,
+                        sharding_type="column"
                     )
+                    if layer.use_bias:
+                        state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                            world_size=world_size, 
+                            dim=0,
+                            sharding_type="row"
+                        )
+                    
+                    # Output is distributed (no communication needed)
+                    output_rules[f"^{full_name}$"] = {0: "no_comm"}
+                    
+                    logger.info(f"Applied Column-wise sharding to MLP up-projection {full_name} (direct-analysis)")
                 
-                # Output needs to be gathered
-                output_rules[f"^{full_name}$"] = {0: "gather -1"}
+                elif mlp_type == 'down_projection':
+                    # Row-wise sharding: split input dimension
+                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(
+                        world_size=world_size, 
+                        dim=0,
+                        sharding_type="row"
+                    )
+                    if layer.use_bias:
+                        state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                            world_size=world_size, 
+                            dim=0,
+                            sharding_type="row"
+                        )
+                    
+                    # Output needs AllReduce to combine
+                    output_rules[f"^{full_name}$"] = {0: "allreduce"}
+                    
+                    logger.info(f"Applied Row-wise sharding to MLP down-projection {full_name} (direct-analysis)")
+                
+                else:
+                    # Generic Dense layer handling (fallback)
+                    # Always use column-wise sharding for generic Dense layers (optimal approach)
+                    kernel_dim = 1  # Split output features
+                    bias_dim = 0    # Split bias along output dimension
+                    
+                    # Apply sharding rules
+                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(
+                        world_size=world_size, 
+                        dim=kernel_dim,
+                        sharding_type="column"
+                    )
+                    if layer.use_bias:
+                        state_rules[f"^{full_name}.bias$"] = SplitKeras(
+                            world_size=world_size, 
+                            dim=bias_dim,
+                            sharding_type="row"
+                        )
+                    
+                    # Output needs to be gathered
+                    output_rules[f"^{full_name}$"] = {0: "gather -1"}
                 
             # Handle EinsumDense layers (common in transformer models like OPT)
             elif isinstance(layer, layers.EinsumDense):
@@ -150,24 +234,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_
                 # Output needs to be gathered
                 output_rules[f"^{full_name}$"] = {0: "gather -1"}
                 
-            # Handle Conv2D layers
-            elif isinstance(layer, (layers.Conv2D, layers.Conv1D, layers.Conv3D)):
-                # Split along output channels (dim=-1)
-                state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=-1)
-                if layer.use_bias:
-                    state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size=world_size, dim=-1)
-                    
-                # Output needs to be gathered
-                output_rules[f"^{full_name}$"] = {0: "gather -1"}
-                
-            # Handle LSTM layers
-            elif isinstance(layer, layers.LSTM):
-                # Split along hidden size dimension
-                state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=1)
-                if layer.recurrent_activation == "sigmoid":
-                    # For LSTM, we need to handle the gates properly
-                    pass
-                    
             # Handle Attention layers with Column -> Row pattern
             elif isinstance(layer, layers.MultiHeadAttention):
                 # QKV Projection: Column-sharded (split output dimension)
@@ -196,46 +262,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_
                 
                 logger.info(f"Applied Column->Row pattern to {full_name}")
             
-            # Handle MLP/Feed-Forward Network layers with Column -> Row pattern
-            elif isinstance(layer, layers.Dense) and "mlp" in full_name.lower():
-                # MLP layers follow the same Column -> Row pattern as attention
-                # First Dense layer (up-projection): Column-sharded (split output dimension)
-                if "up" in full_name.lower() or "h_to_4h" in full_name.lower() or "gate" in full_name.lower():
-                    # Column-wise sharding: split output dimension
-                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=1)
-                    if layer.use_bias:
-                        state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size=world_size, dim=0)
-                    
-                    # Output is distributed (no communication needed)
-                    output_rules[f"^{full_name}$"] = {0: "no_comm"}
-                    
-                    logger.info(f"Applied Column-wise sharding to MLP up-projection {full_name}")
-                
-                # Second Dense layer (down-projection): Row-sharded (split input dimension)
-                elif "down" in full_name.lower() or "4h_to_h" in full_name.lower() or "proj" in full_name.lower():
-                    # Row-wise sharding: split input dimension
-                    state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=0)
-                    if layer.use_bias:
-                        state_rules[f"^{full_name}.bias$"] = SplitKeras(world_size=world_size, dim=0)
-                    
-                    # Output needs AllReduce to combine
-                    output_rules[f"^{full_name}$"] = {0: "allreduce"}
-                    
-                    logger.info(f"Applied Row-wise sharding to MLP down-projection {full_name}")
-                
-                # Generic MLP handling (if naming doesn't match specific patterns)
-                else:
-                    # Assume first layer is column-sharded, second is row-sharded
-                    # This is a fallback for generic MLP layers
-                    if "first" in full_name.lower() or "1" in full_name:
-                        state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=1)
-                        output_rules[f"^{full_name}$"] = {0: "no_comm"}
-                        logger.info(f"Applied Column-wise sharding to generic MLP layer {full_name}")
-                    else:
-                        state_rules[f"^{full_name}.kernel$"] = SplitKeras(world_size=world_size, dim=0)
-                        output_rules[f"^{full_name}$"] = {0: "allreduce"}
-                        logger.info(f"Applied Row-wise sharding to generic MLP layer {full_name}")
-                
             # Handle LayerNormalization layers
             elif isinstance(layer, layers.LayerNormalization):
                 # LayerNormalization needs to be aware of the sharded hidden size
@@ -256,7 +282,5 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str], sharding_
     
     return ConfigKeras(
         state_rules=state_rules,
-        input_rules=input_rules,
-        output_rules=output_rules,
-        attr_rules=attr_rules
+        output_rules=output_rules
     ) 

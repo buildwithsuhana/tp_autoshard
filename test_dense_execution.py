@@ -3,16 +3,29 @@
 Test simple Dense layer tensor parallelism execution
 """
 
+import os
 import numpy as np
+
+# 💻 Set this flag BEFORE importing jax
+# This tells JAX to simulate 2 CPU devices.
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
+
+# Import JAX first to ensure device detection works
+import jax
+print(f"🔍 JAX Device Detection:")
+print(f"   Number of JAX devices: {jax.local_device_count()}")
+print(f"   Device list: {jax.devices()}")
+print(f"   Device types: {[str(d) for d in jax.devices()]}")
+
 import keras
 from keras.layers import Input, Dense
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 
-def create_dense_model():
-    """Create a simple Dense layer model."""
+def create_simple_model():
+    """Create a simple Dense model."""
     inputs = Input(shape=(64,), name='input_tensor')
     
-    # Single Dense layer
+    # Dense layer
     output = Dense(32, activation='relu', name='dense')(inputs)
     
     model = keras.Model(inputs=inputs, outputs=output)
@@ -23,15 +36,14 @@ def test_dense_execution():
     print("Testing simple Dense layer tensor parallelism execution...")
     
     # Create model
-    model = create_dense_model()
+    model = create_simple_model()
     print(f"Model created with {len(model.layers)} layers")
     
-    # Create tensor parallel model
+    # Create tensor parallel model with JAX backend
     tp_model = TensorParallelKeras(
         model=model,
         world_size=2,
-        device_ids=['cpu:0', 'cpu:1'],
-        distributed_backend='fallback'
+        distributed_backend='jax'  # Use JAX backend
     )
     print("Tensor parallel model created")
     

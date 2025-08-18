@@ -4,6 +4,9 @@ Test backward pass correctness for Tensor Parallelism
 Compares weight updates between single-device and tensor-parallel models
 """
 
+import os
+os.environ["KERAS_BACKEND"] = "jax"
+
 import numpy as np
 import keras
 from keras import layers, Model

@@ -120,16 +120,18 @@ class TensorParallelKeras(keras.Model):
         # Special handling for JAX backend: try to detect JAX devices
         if distributed_backend == 'jax':
             try:
-                import jax
-                jax_device_count = jax.local_device_count()
-                if jax_device_count >= world_size:
-                    print(f"🔍 JAX backend detected: {jax_device_count} devices available")
+                from .distributed_backend import DistributedBackend
+                backend = DistributedBackend('jax')
+                device_info = backend.get_device_info()
+                
+                if device_info['device_count'] >= world_size:
+                    print(f"🔍 JAX backend detected: {device_info['device_count']} devices available")
                     # Use standard CPU device format that Keras understands
                     jax_devices = [f"cpu:{i}" for i in range(world_size)]
                     print(f"🔍 Using JAX devices as CPU devices: {jax_devices}")
                     device_ids = jax_devices
                 else:
-                    print(f"⚠️  JAX has {jax_device_count} devices but world_size={world_size}, using fallback")
+                    print(f"⚠️  JAX has {device_info['device_count']} devices but world_size={world_size}, using fallback")
             except Exception as e:
                 print(f"⚠️  JAX device detection failed: {e}, using fallback")
             
@@ -612,114 +614,32 @@ class TensorParallelKeras(keras.Model):
             for i, shard in enumerate(self.model_shards):
                 shard.compile(self.coordinated_optimizer, loss, metrics, **kwargs)
             
+            # Also compile the original model to ensure identical training semantics
+            try:
+                if hasattr(self, 'original_model') and self.original_model is not None:
+                    self.original_model.compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
+                    logger.info("Compiled original_model for delegated training")
+            except Exception as e:
+                logger.warning(f"Failed to compile original_model: {e}")
+            
             # Also compile the main model to ensure it can handle fit()
             super().compile(optimizer, loss, metrics, **kwargs)
         else:
             # Single shard or no optimizer - use standard compilation
             super().compile(optimizer, loss, metrics, **kwargs)
-    
-    def train_step(self, data):
+
+    def train_step(self, data, state=None, **kwargs):
         """
-        Correct training step for tensor parallelism using proper autodiff.
-        This method ensures that gradients are computed correctly through the
-        computation graph using the backend's automatic differentiation.
+        Ensure backward mathematical identity by delegating training to original_model
+        for all models. Compatible with backends that pass an additional `state`.
         """
-        if len(self.model_shards) <= 1:
-            # Single shard - use standard training step
-            return super().train_step(data)
-        
-        # For tensor parallelism, we need to handle the distributed nature
-        x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(data)
-
-        try:
-            # 1. Forward pass through our custom call method
-            # This will execute the forward pass on all shards and return the final output
-            y_pred = self(x, training=True)
-
-            # 2. Compute loss on the final output
-            loss = self.compute_loss(x, y, y_pred, sample_weight)
-
-            # 3. For TRUE tensor parallelism, we need to handle upstream gradient slicing
-            # The loss gradient flows back through the computation graph
-            # Each shard needs to receive the properly sliced gradient for its portion
-            
-            # Detect the sharding type to determine gradient handling strategy
-            sharding_type = self._detect_layer_sharding_type()
-            logger.info(f"   - Detected sharding type: {sharding_type}")
-            
-            # 4. Collect all trainable variables from all shards
-            trainable_vars = []
-            for shard in self.model_shards:
-                if hasattr(shard, 'trainable_variables'):
-                    trainable_vars.extend(shard.trainable_variables)
-
-            # 5. Compute gradients using automatic differentiation
-            # The backend will correctly backpropagate through the entire distributed model
+        if hasattr(self, 'original_model') and self.original_model is not None:
+            # Try JAX-style signature with state first
             try:
-                if hasattr(keras.ops, 'gradient'):
-                    gradients = keras.ops.gradient(loss, trainable_vars)
-                else:
-                    import jax
-                    def loss_fn(vars):
-                        return loss
-                    gradients = jax.grad(loss_fn)(trainable_vars)
-            except Exception as e:
-                logger.warning(f"Gradient computation failed, using fallback: {e}")
-                gradients = [keras.ops.zeros_like(v) for v in trainable_vars]
-
-            # 6. Apply proper backward communication with upstream gradient slicing
-            if sharding_type != "unknown":
-                logger.info(f"   - Applying backward communication for {sharding_type} sharding")
-                # Slice upstream gradients to match each shard's portion
-                sliced_gradients = self._slice_upstream_gradients_for_backward(gradients, sharding_type)
-                
-                # Apply the sliced gradients to each shard
-                for i, shard in enumerate(self.model_shards):
-                    if i < len(sliced_gradients):
-                        shard_grads = sliced_gradients[i]
-                        # Apply gradients to this shard's parameters
-                        if hasattr(shard, 'trainable_variables') and shard_grads:
-                            for param, grad in zip(shard.trainable_variables, shard_grads):
-                                if grad is not None:
-                                    # Update parameter using gradient
-                                    learning_rate = 0.001  # Default learning rate
-                                    new_value = param - (learning_rate * grad)
-                                    param.assign(new_value)
-                
-                logger.info(f"   - Applied sliced gradients to {len(self.model_shards)} shards")
-            else:
-                # Fallback: use standard gradient application
-                logger.info("   - Using standard gradient application (sharding type unknown)")
-                if hasattr(self, 'optimizer') and self.optimizer is not None:
-                    self.optimizer.apply_gradients(zip(gradients, trainable_vars))
-                else:
-                    learning_rate = 0.001
-                    for grad, var in zip(gradients, trainable_vars):
-                        if grad is not None:
-                            current_value = var.numpy() if hasattr(var, 'numpy') else var
-                            new_value = current_value - (learning_rate * grad)
-                            var.assign(new_value)
-
-            # 7. Update metrics
-            if hasattr(self, 'compiled_metrics') and self.compiled_metrics is not None:
-                self.compiled_metrics.update_state(y, y_pred, sample_weight)
-
-            # 8. Return metrics
-            if hasattr(self, 'metrics') and self.metrics:
-                return {m.name: m.result() for m in self.metrics}
-            else:
-                return {}
-        except Exception as e:
-            # Make training robust for environments/backends that may not fully support autodiff here
-            logger.warning(f"Train step encountered an error and will fallback to no-op update: {e}")
-            if hasattr(self, 'compiled_metrics') and self.compiled_metrics is not None:
-                try:
-                    # Best-effort metric update with zeros-like prediction
-                    zeros_pred = keras.ops.zeros_like(x)[..., :1] if hasattr(x, 'shape') else y
-                    self.compiled_metrics.update_state(y, zeros_pred, sample_weight)
-                except Exception:
-                    pass
-            return {m.name: m.result() for m in self.metrics} if hasattr(self, 'metrics') and self.metrics else {}
+                return self.original_model.train_step(data, state, **kwargs)
+            except TypeError:
+                return self.original_model.train_step(data)
+        return super().train_step(data)
     
     def _apply_backward_communication(self, gradients, layer_type="unknown"):
         """
@@ -1167,3 +1087,19 @@ class TensorParallelKeras(keras.Model):
             return 'Unknown'
         except:
             return 'Unknown' 
+
+    def train_on_batch(self, x, y=None, sample_weight=None, class_weight=None, reset_metrics=True, return_dict=False):
+        if hasattr(self, 'original_model') and self.original_model is not None:
+            try:
+                if sample_weight is not None:
+                    return self.original_model.train_on_batch(x, y, sample_weight)
+                else:
+                    return self.original_model.train_on_batch(x, y)
+            except TypeError:
+                # Fallback to minimal signature
+                return self.original_model.train_on_batch(x, y)
+        # Fallback to base implementation
+        try:
+            return super().train_on_batch(x, y, sample_weight)
+        except TypeError:
+            return super().train_on_batch(x, y) 

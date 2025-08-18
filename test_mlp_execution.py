@@ -1,48 +1,57 @@
 #!/usr/bin/env python3
 """
-Test MLP tensor parallelism execution
+Test MLP (Multi-Layer Perceptron) tensor parallelism execution
 """
 
+import os
 import numpy as np
+
+# 💻 Simulate 2 CPU devices for JAX BEFORE importing jax
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
+
+import jax
+print(f"🔍 JAX Device Detection:")
+print(f"   Number of JAX devices: {jax.local_device_count()}")
+print(f"   Device list: {jax.devices()}")
+print(f"   Device types: {[str(d) for d in jax.devices()]}")
+
 import keras
-from keras.layers import Input, Dense
+from keras.layers import Input, Dense, Dropout
+from keras import Sequential
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 
 def create_mlp_model():
-    """Create a simple MLP model with up/down projection."""
-    inputs = Input(shape=(32,), name='input_tensor')
-    
-    # Up projection: 32 -> 128 (expansion)
-    dense_up = Dense(128, activation='relu', name='dense_up')(inputs)
-    
-    # Down projection: 128 -> 16 (contraction)
-    dense_down = Dense(16, activation='relu', name='dense_down')(dense_up)
-    
-    # Final output
-    output = Dense(32, activation='linear', name='output_dense')(dense_down)
-    
-    model = keras.Model(inputs=inputs, outputs=output)
+    """Create a simple MLP model with multiple dense layers."""
+    model = Sequential([
+        Input(shape=(128,), name='input_tensor'),
+        Dense(256, activation='relu', name='dense_1'),
+        Dropout(0.1, name='dropout_1'),
+        Dense(512, activation='relu', name='dense_2'),
+        Dropout(0.1, name='dropout_2'),
+        Dense(256, activation='relu', name='dense_3'),
+        Dense(64, activation='relu', name='dense_4'),
+        Dense(10, activation='softmax', name='output_dense')
+    ])
     return model
 
 def test_mlp_execution():
     """Test MLP tensor parallelism execution."""
-    print("Testing MLP tensor parallelism execution...")
+    print("Testing MLP (Multi-Layer Perceptron) tensor parallelism execution...")
     
     # Create model
     model = create_mlp_model()
     print(f"Model created with {len(model.layers)} layers")
     
-    # Create tensor parallel model
+    # Create tensor parallel model with JAX backend
     tp_model = TensorParallelKeras(
         model=model,
         world_size=2,
-        device_ids=['cpu:0', 'cpu:1'],
-        distributed_backend='fallback'
+        distributed_backend='jax'  # Use JAX backend
     )
     print("Tensor parallel model created")
     
     # Create test input
-    input_data = np.random.random((8, 32)).astype(np.float32)
+    input_data = np.random.random((16, 128)).astype(np.float32)
     print(f"Input data shape: {input_data.shape}")
     
     # Run single device model
@@ -83,6 +92,14 @@ def test_mlp_execution():
         print(f"  Single device: {single_np[0, :5]}")
         print(f"  Tensor parallel: {tp_np[0, :5]}")
         print(f"  Differences: {abs_diff[0, :5]}")
+        
+        # Show layer-by-layer sharding info
+        print("\n🔧 Layer Sharding Information:")
+        for i, layer in enumerate(model.layers):
+            if hasattr(layer, 'weights') and layer.weights:
+                for j, weight in enumerate(layer.weights):
+                    if hasattr(weight, 'shape'):
+                        print(f"  Layer {i} ({layer.name}) - Weight {j}: {weight.shape}")
     else:
         print("❌ Shape mismatch - execution failed")
 

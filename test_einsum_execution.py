@@ -3,7 +3,18 @@
 Test EinsumDense tensor parallelism execution
 """
 
+import os
 import numpy as np
+
+# 💻 Simulate 2 CPU devices for JAX BEFORE importing jax
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
+
+import jax
+print(f"🔍 JAX Device Detection:")
+print(f"   Number of JAX devices: {jax.local_device_count()}")
+print(f"   Device list: {jax.devices()}")
+print(f"   Device types: {[str(d) for d in jax.devices()]}")
+
 import keras
 from keras.layers import Input, EinsumDense, Dense
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
@@ -33,11 +44,11 @@ def test_einsum_execution():
     model = create_einsum_model()
     print(f"Model created with {len(model.layers)} layers")
     
-    # Create tensor parallel model
+    # Create tensor parallel model with JAX backend
     tp_model = TensorParallelKeras(
         model=model,
         world_size=2,
-        distributed_backend='fallback'
+        distributed_backend='jax'  # Use JAX backend
     )
     print("Tensor parallel model created")
     

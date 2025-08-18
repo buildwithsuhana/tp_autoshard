@@ -3,10 +3,22 @@
 Test Multi-Head Attention tensor parallelism execution
 """
 
+import os
 import numpy as np
+
+# 💻 Simulate 2 CPU devices for JAX BEFORE importing jax
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
+
+import jax
+print(f"🔍 JAX Device Detection:")
+print(f"   Number of JAX devices: {jax.local_device_count()}")
+print(f"   Device list: {jax.devices()}")
+print(f"   Device types: {[str(d) for d in jax.devices()]}")
+
 import keras
 from keras.layers import Input, MultiHeadAttention, Dense
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
+
 
 def create_attention_model():
     """Create a simple Multi-Head Attention model."""
@@ -25,6 +37,7 @@ def create_attention_model():
     model = keras.Model(inputs=inputs, outputs=output)
     return model
 
+
 def test_mha_execution():
     """Test Multi-Head Attention tensor parallelism execution."""
     print("Testing Multi-Head Attention tensor parallelism execution...")
@@ -33,11 +46,11 @@ def test_mha_execution():
     model = create_attention_model()
     print(f"Model created with {len(model.layers)} layers")
     
-    # Create tensor parallel model
+    # Create tensor parallel model with JAX backend
     tp_model = TensorParallelKeras(
         model=model,
         world_size=2,
-        distributed_backend='fallback'
+        distributed_backend='jax'
     )
     print("Tensor parallel model created")
     
@@ -85,6 +98,7 @@ def test_mha_execution():
         print(f"  Differences: {abs_diff[0, 0, :5]}")
     else:
         print("❌ Shape mismatch - execution failed")
+
 
 if __name__ == "__main__":
     test_mha_execution() 

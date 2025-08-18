@@ -24,6 +24,10 @@ class ShardedWeight:
     def __init__(self, torch_tensor, name):
         self.torch_tensor = torch_tensor
         self.name = name
+        # Expose a trainable flag for Keras compatibility when scanning weights
+        self.trainable = True
+        # Keras may check for a regularizer attribute on weights
+        self.regularizer = None
     
     @property
     def shape(self):

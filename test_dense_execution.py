@@ -30,6 +30,7 @@ def test_dense_execution():
     tp_model = TensorParallelKeras(
         model=model,
         world_size=2,
+        device_ids=['cpu:0', 'cpu:1'],
         distributed_backend='fallback'
     )
     print("Tensor parallel model created")

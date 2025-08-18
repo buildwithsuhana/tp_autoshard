@@ -618,7 +618,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     Inherits from keras.Optimizer for compatibility.
     """
     
-    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int):
+    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, distributed_backend: str = 'auto'):
         """
         Initialize tensor parallel optimizer.
         
@@ -665,7 +665,8 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         else:
             self.base_optimizer = base_optimizer
             
-        self.coordinated_optimizer = CoordinatedOptimizer(self.base_optimizer, world_size)
+        # Ensure coordinated optimizer uses same distributed backend as model
+        self.coordinated_optimizer = CoordinatedOptimizer(self.base_optimizer, world_size, distributed_backend=distributed_backend)
         self.world_size = world_size
         self.base_optimizer = base_optimizer
     

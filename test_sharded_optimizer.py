@@ -36,6 +36,7 @@ def test_sharded_optimizer_states():
     
     # Test different world sizes
     world_sizes = [2, 4, 8]
+    all_tests_passed = True
     
     for world_size in world_sizes:
         print(f"\n🔄 Testing with world_size={world_size}")
@@ -69,8 +70,12 @@ def test_sharded_optimizer_states():
             print(f"      ✅ Sharding enabled successfully")
             if 'memory_savings' in memory_info:
                 print(f"      💾 Memory savings: {memory_info['memory_savings']}")
+        else:
+            all_tests_passed = False
+            print(f"      ❌ Sharding not enabled")
     
     print(f"✅ Sharded optimizer test completed in {time.time() - start_time:.2f}s")
+    return all_tests_passed
 
 def test_optimizer_state_management():
     """Test optimizer state management (enable/disable sharding)."""
@@ -109,6 +114,14 @@ def test_optimizer_state_management():
     print(f"   Memory info after re-enabling: {memory_after_reenable}")
     
     print(f"✅ State management test completed in {time.time() - start_time:.2f}s")
+    
+    # Check if the enable/disable cycle worked correctly
+    if (initial_memory['sharding_enabled'] and 
+        not memory_after_disable['sharding_enabled'] and 
+        memory_after_reenable['sharding_enabled']):
+        return True
+    else:
+        return False
 
 def test_tensor_parallel_optimizer():
     """Test TensorParallelOptimizer functionality."""
@@ -138,6 +151,14 @@ def test_tensor_parallel_optimizer():
     print(f"   - Memory info: {memory_info}")
     
     print(f"✅ TensorParallelOptimizer test completed in {time.time() - start_time:.2f}s")
+    
+    # Check if optimizer was created successfully
+    if (tp_optimizer.world_size == 2 and 
+        memory_info['sharding_enabled'] and 
+        'memory_savings' in memory_info):
+        return True
+    else:
+        return False
 
 if __name__ == "__main__":
     print("🎯 SHARDED OPTIMIZER STATES COMPREHENSIVE TEST")

@@ -630,16 +630,18 @@ class TensorParallelKeras(keras.Model):
 
     def train_step(self, data, state=None, **kwargs):
         """
-        Ensure backward mathematical identity by delegating training to original_model
-        for all models. Compatible with backends that pass an additional `state`.
+        Ensure backward mathematical identity by using tensor parallel model's own training.
+        Compatible with backends that pass an additional `state`.
         """
-        if hasattr(self, 'original_model') and self.original_model is not None:
-            # Try JAX-style signature with state first
-            try:
-                return self.original_model.train_step(data, state, **kwargs)
-            except TypeError:
-                return self.original_model.train_step(data)
-        return super().train_step(data)
+        # Use the tensor parallel model's own training method to ensure proper compilation
+        try:
+            if state is not None:
+                return super().train_step(data, state, **kwargs)
+            else:
+                return super().train_step(data, **kwargs)
+        except Exception as e:
+            # Fallback to minimal signature
+            return super().train_step(data)
     
     def _apply_backward_communication(self, gradients, layer_type="unknown"):
         """
@@ -1089,17 +1091,16 @@ class TensorParallelKeras(keras.Model):
             return 'Unknown' 
 
     def train_on_batch(self, x, y=None, sample_weight=None, class_weight=None, reset_metrics=True, return_dict=False):
-        if hasattr(self, 'original_model') and self.original_model is not None:
-            try:
-                if sample_weight is not None:
-                    return self.original_model.train_on_batch(x, y, sample_weight)
-                else:
-                    return self.original_model.train_on_batch(x, y)
-            except TypeError:
-                # Fallback to minimal signature
-                return self.original_model.train_on_batch(x, y)
-        # Fallback to base implementation
+        """
+        Train on a single batch of data using tensor parallelism.
+        Delegates to the base Keras training method to ensure proper compilation.
+        """
+        # Use the tensor parallel model's own training method instead of delegating to uncompiled original_model
         try:
-            return super().train_on_batch(x, y, sample_weight)
-        except TypeError:
+            if sample_weight is not None:
+                return super().train_on_batch(x, y, sample_weight, class_weight, reset_metrics, return_dict)
+            else:
+                return super().train_on_batch(x, y, class_weight=class_weight, reset_metrics=reset_metrics, return_dict=return_dict)
+        except Exception as e:
+            # Fallback to minimal signature if there are any issues
             return super().train_on_batch(x, y) 

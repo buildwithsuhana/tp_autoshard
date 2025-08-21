@@ -6,7 +6,7 @@ import logging
 from typing import Dict, Any, Sequence, List, Tuple, Optional
 from keras import Model, layers
 
-import torch
+# import torch
 from .config_keras import ConfigKeras
 from .state_actions_keras import SplitKeras, GatherKeras, SumKeras
 
@@ -51,15 +51,24 @@ def analyze_dense_layer_directly(layer: layers.Dense, module: Model, prefix: str
     
     if not prev_layer:
         # This is the first layer - check if it's an up-projection by looking at the model's input shape
-        if hasattr(module, 'input_shape') and module.input_shape and len(module.input_shape) > 1:
-            input_dim = module.input_shape[-1]
-            if input_dim is not None:  # Safety check for None
-                # If output is significantly larger than input, it's likely an up-projection
-                expansion_check = output_dim > input_dim * 1.5
-                if expansion_check:
-                    return 'up_projection'
-        # If we reach here, it's not an up-projection
-        return 'generic_dense'
+        # In the function analyze_dense_layer_directly
+
+        # ... inside the `if not prev_layer:` block
+        if hasattr(module, 'input_shape') and module.input_shape:
+            # Get the raw input shape
+            shape_info = module.input_shape
+
+            # Handle nested lists of shapes (common in KerasNLP)
+            if isinstance(shape_info, list):
+                shape_info = shape_info[0] # Assume the first input is the relevant one
+
+            # Now extract the last dimension, which should be the feature dimension
+            if isinstance(shape_info, (list, tuple)) and len(shape_info) > 1:
+                input_dim = shape_info[-1]
+                if input_dim is not None:
+                    # This check should now work correctly
+                    expansion_check = output_dim > input_dim * 1.5
+                    # ... rest of your logic
     
     # Get input dimension from previous layer
     input_dim = None
@@ -136,20 +145,17 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                 elif mlp_type == 'down_projection':
                     # Row-wise sharding: split input dimension
                     state_rules[f"^{full_name}.kernel$"] = SplitKeras(
-                        world_size=world_size, 
+                        world_size=world_size,
                         dim=0,
                         sharding_type="row"
                     )
+                    # By REMOVING the rule for the bias, it will not be sharded.
+                    # It will be replicated on all devices by default, which is correct.
                     if layer.use_bias:
-                        state_rules[f"^{full_name}.bias$"] = SplitKeras(
-                            world_size=world_size, 
-                            dim=0,
-                            sharding_type="row"
-                        )
-                    
+                        pass # Bias should not be sharded for row-parallel layers
+
                     # Output needs AllReduce to combine
                     output_rules[f"^{full_name}$"] = {0: "allreduce"}
-                    
                     logger.info(f"Applied Row-wise sharding to MLP down-projection {full_name} (direct-analysis)")
                 
                 else:

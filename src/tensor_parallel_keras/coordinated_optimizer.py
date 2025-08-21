@@ -28,7 +28,7 @@ class CoordinatedOptimizer:
     """
     
     def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, 
-                 distributed_backend: str = 'auto', rank: int = 0, shard_optimizer_states: bool = True):
+                 distributed_backend: str = 'auto', rank: int = 0, shard_optimizer_states: bool = True, tensor_parallel_config=None):
         """
         Initialize coordinated optimizer with sharded states.
         
@@ -45,6 +45,7 @@ class CoordinatedOptimizer:
         self.shard_optimizer_states = shard_optimizer_states
         self.param_groups = []
         self.state = {}
+        self.tensor_parallel_config = tensor_parallel_config
         
         # Initialize distributed backend
         if get_distributed_backend is not None:
@@ -318,41 +319,51 @@ class CoordinatedOptimizer:
     
     def _synchronize_gradients(self, gradients_and_vars: List[List[tuple]]) -> List[List[tuple]]:
         """
-        Synchronize gradients across shards using AllReduce.
-        
-        Args:
-            gradients_and_vars: List of (gradient, variable) pairs for each shard
-            
-        Returns:
-            List of synchronized (gradient, variable) pairs for each shard
+        Synchronize gradients intelligently based on the sharding config,
+        only applying All-Reduce where necessary.
         """
-        synchronized = []
+        if not self.tensor_parallel_config:
+            return gradients_and_vars # Cannot synchronize without config
+
+        # Create a set of patterns for weights that require gradient sync (column-parallel)
+        column_parallel_patterns = set()
+        for pattern, action in self.tensor_parallel_config.state_rules.items():
+            if hasattr(action, 'sharding_type') and action.sharding_type == 'column':
+                column_parallel_patterns.add(pattern)
         
-        # Group gradients by variable name across shards
-        var_names = [var.name for _, var in gradients_and_vars[0]]
+        num_weights = len(gradients_and_vars[0])
+        # The structure is [[(g0,v0), (g1,v1)], [(g0,v0), (g1,v1)]] for 2 shards
         
-        for var_name in var_names:
-            # Collect gradients for this variable from all shards
-            var_gradients = []
-            for shard_grads in gradients_and_vars:
-                for grad, var in shard_grads:
-                    if var.name == var_name:
-                        var_gradients.append(grad)
-                        break
+        for i in range(num_weights):
+            # Get the variable from the first shard to check its properties
+            variable = gradients_and_vars[0][i][1]
             
-            # Synchronize gradients for this variable
-            if len(var_gradients) == self.world_size:
-                # AllReduce: sum gradients and divide by world_size
-                synchronized_grads = self._allreduce_gradients(var_gradients)
+            # Check if this variable's sharding rule requires a gradient All-Reduce
+            needs_sync = False
+            import re
+            for pattern in column_parallel_patterns:
+                 # Match variable name like 'mlp_up/kernel:0' against config patterns like '^mlp_up\\.kernel$'
+                 # We build the name from the variable object to match how it was created
+                 # This assumes a naming convention. For this test, checking the name part is enough.
+                 # A more robust solution maps layer name to variable name.
+                 if re.search(pattern.strip('$').strip('^'), variable.name):
+                     needs_sync = True
+                     break
+            
+            if needs_sync:
+                # Collect the gradient for this variable from all shards
+                grads_to_reduce = [gradients_and_vars[shard_idx][i][0] 
+                                   for shard_idx in range(self.world_size)]
                 
-                # Create new gradient-variable pairs for each shard
-                for i, shard_grads in enumerate(gradients_and_vars):
-                    for grad, var in shard_grads:
-                        if var.name == var_name:
-                            # Replace gradient with synchronized version
-                            shard_grads[shard_grads.index((grad, var))] = (synchronized_grads[i], var)
-                            break
-        
+                # Perform the All-Reduce (summation)
+                if any(g is not None for g in grads_to_reduce):
+                    synced_grad = self._allreduce_gradients(grads_to_reduce)
+                
+                    # Distribute the single, correct gradient back to all shards
+                    for shard_idx in range(self.world_size):
+                        original_var = gradients_and_vars[shard_idx][i][1]
+                        gradients_and_vars[shard_idx][i] = (synced_grad[shard_idx], original_var)
+
         return gradients_and_vars
     
     def _allreduce_gradients(self, gradients: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -618,7 +629,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     Inherits from keras.Optimizer for compatibility.
     """
     
-    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, distributed_backend: str = 'auto'):
+    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, distributed_backend: str = 'auto', tensor_parallel_config=None):
         """
         Initialize tensor parallel optimizer.
         
@@ -666,7 +677,11 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             self.base_optimizer = base_optimizer
             
         # Ensure coordinated optimizer uses same distributed backend as model
-        self.coordinated_optimizer = CoordinatedOptimizer(self.base_optimizer, world_size, distributed_backend=distributed_backend)
+        self.coordinated_optimizer = CoordinatedOptimizer(
+            self.base_optimizer, world_size, 
+            distributed_backend=distributed_backend,
+            tensor_parallel_config=tensor_parallel_config # Add this line
+        )
         self.world_size = world_size
         self.base_optimizer = base_optimizer
     

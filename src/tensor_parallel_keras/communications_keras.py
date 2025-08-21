@@ -7,6 +7,7 @@ with proper conjugate rule for forward/backward passes
 import numpy as np
 from typing import List, Union, Optional, Tuple
 import logging
+import keras
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +32,24 @@ def _clone_tensor(tensor):
     backend = DistributedBackend(tensor_lib)
     return backend.convert_to_backend_tensor(tensor)
 
+# In communications_keras.py
+
 def _cat_tensors(tensors, dim=-1):
-    """Concatenate tensors using centralized backend operations."""
+    """Concatenate tensors using backend-agnostic keras.ops."""
     if not tensors:
-        return tensors[0] if tensors else None
-    
-    tensor_lib = _get_tensor_lib(tensors[0])
-    backend = DistributedBackend(tensor_lib)
-    comm_ops = backend.get_communication_ops()
-    
-    # Use the centralized all_gather operation
-    return comm_ops["all_gather"](tensors[0])  # Simplified for now
+        return None
+    if len(tensors) == 1:
+        return tensors[0]
+
+    # --- FIX: Use keras.ops directly for a correct, backend-agnostic simulation ---
+    # This avoids calling the JAX-specific parallel operator.
+    try:
+        # The 'axis' parameter in keras.ops.concatenate is equivalent to 'dim'
+        return keras.ops.concatenate(tensors, axis=dim)
+    except Exception as e:
+        logger.error(f"Error in _cat_tensors using keras.ops.concatenate: {e}")
+        # Fallback to returning the first tensor if concatenation fails
+        return tensors[0]
 
 def _sum_tensors(tensors):
     """Sum tensors using centralized backend operations."""

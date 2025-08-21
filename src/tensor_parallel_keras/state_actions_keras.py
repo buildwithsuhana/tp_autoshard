@@ -2,20 +2,18 @@
 State actions for Keras Tensor Parallel
 Handles parameter splitting, gathering, and reduction operations
 """
-
-import torch
-from typing import Sequence, Union
-from keras import backend as K
+from typing import Any, Sequence
+import keras
 
 
 class StateActionKeras:
     """Base class for state actions."""
     
-    def __call__(self, tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    def __call__(self, tensor: Any, rank: int) -> Any:
         """Apply the action to a tensor."""
         raise NotImplementedError
         
-    def undo(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    def undo(self, tensors: Sequence[Any]) -> Any:
         """Reverse the action to reconstruct the original tensor."""
         raise NotImplementedError
 
@@ -35,14 +33,13 @@ class SplitKeras(StateActionKeras):
             elif sharding_type == "column":
                 self.dim = 1
         
-    def __call__(self, tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    def __call__(self, tensor: Any, rank: int) -> Any:
         """Split tensor and return the portion for this rank."""
         if self.dim == -1:
-            dim = tensor.dim() - 1
+            # Use keras.ops.ndim instead of tensor.dim()
+            dim = keras.ops.ndim(tensor) - 1
         else:
             dim = self.dim
-            
-
             
         # Calculate split sizes
         total_size = tensor.shape[dim]
@@ -53,31 +50,20 @@ class SplitKeras(StateActionKeras):
         start_idx = rank * split_size + min(rank, remainder)
         end_idx = start_idx + split_size + (1 if rank < remainder else 0)
         
-
-        
-        # Split the tensor
-        if dim == 0:
-            return tensor[start_idx:end_idx]
-        elif dim == 1:
-            return tensor[:, start_idx:end_idx]
-        elif dim == 2:
-            return tensor[:, :, start_idx:end_idx]
-        elif dim == 3:
-            return tensor[:, :, :, start_idx:end_idx]
-        else:
-            # For higher dimensions, use advanced indexing
-            slices = [slice(None)] * tensor.dim()
-            slices[dim] = slice(start_idx, end_idx)
-            return tensor[tuple(slices)]
+        # Slicing works natively on Keras tensors
+        slices = [slice(None)] * keras.ops.ndim(tensor)
+        slices[dim] = slice(start_idx, end_idx)
+        return tensor[tuple(slices)]
             
-    def undo(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    def undo(self, tensors: Sequence[Any]) -> Any:
         """Concatenate split tensors back together."""
         if self.dim == -1:
-            dim = tensors[0].dim() - 1
+            dim = keras.ops.ndim(tensors[0]) - 1
         else:
             dim = self.dim
             
-        return torch.cat(tensors, dim=dim)
+        # Use keras.ops.concatenate instead of torch.cat, with 'axis'
+        return keras.ops.concatenate(tensors, axis=dim)
 
 
 class GatherKeras(StateActionKeras):
@@ -87,18 +73,19 @@ class GatherKeras(StateActionKeras):
         self.world_size = world_size
         self.dim = dim
         
-    def __call__(self, tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    def __call__(self, tensor: Any, rank: int) -> Any:
         """Return the tensor as-is (gathering happens in communication layer)."""
         return tensor
         
-    def undo(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    def undo(self, tensors: Sequence[Any]) -> Any:
         """Concatenate gathered tensors."""
         if self.dim == -1:
-            dim = tensors[0].dim() - 1
+            dim = keras.ops.ndim(tensors[0]) - 1
         else:
             dim = self.dim
             
-        return torch.cat(tensors, dim=dim)
+        # Use keras.ops.concatenate instead of torch.cat, with 'axis'
+        return keras.ops.concatenate(tensors, axis=dim)
 
 
 class SumKeras(StateActionKeras):
@@ -107,10 +94,11 @@ class SumKeras(StateActionKeras):
     def __init__(self, world_size: int):
         self.world_size = world_size
         
-    def __call__(self, tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    def __call__(self, tensor: Any, rank: int) -> Any:
         """Return the tensor as-is (summing happens in communication layer)."""
         return tensor
         
-    def undo(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    def undo(self, tensors: Sequence[Any]) -> Any:
         """Sum the tensors."""
-        return sum(tensors) 
+        # The built-in sum() works with Keras tensors by applying the '+' operator
+        return sum(tensors)

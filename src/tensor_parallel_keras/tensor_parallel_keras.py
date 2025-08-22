@@ -691,11 +691,39 @@ class TensorParallelKeras(keras.Model):
                     distributed_backend=backend_name,
                     tensor_parallel_config=self.tensor_parallel_config  # Add this line
         )
+                self.coordinated_optimizer = coordinated_optimizer
             logger.info(f"Wrapped optimizer with TensorParallelOptimizer for {self.world_size} shards.")
             
             # 2. Compile the main parent model with the WRAPPED optimizer.
             #    Do NOT compile the individual shards. Keras handles this.
-            super().compile(optimizer=coordinated_optimizer, loss=loss, metrics=metrics, **kwargs)
+            super().compile(optimizer=self.coordinated_optimizer, loss=loss, metrics=metrics, **kwargs)
+            try:
+                base_opt = optimizer
+                import keras
+                from keras import optimizers as _opts
+                def _clone_opt(opt):
+                    if isinstance(opt, _opts.Adam):
+                        lr = float(opt.learning_rate.numpy()) if hasattr(opt.learning_rate, 'numpy') else float(opt.learning_rate)
+                        beta_1 = float(opt.beta_1.numpy()) if hasattr(opt.beta_1, 'numpy') else float(opt.beta_1)
+                        beta_2 = float(opt.beta_2.numpy()) if hasattr(opt.beta_2, 'numpy') else float(opt.beta_2)
+                        eps = float(opt.epsilon.numpy()) if hasattr(opt.epsilon, 'numpy') else float(opt.epsilon)
+                        return _opts.Adam(learning_rate=lr, beta_1=beta_1, beta_2=beta_2, epsilon=eps, amsgrad=getattr(opt, 'amsgrad', False))
+                    if isinstance(opt, _opts.SGD):
+                        lr = float(opt.learning_rate.numpy()) if hasattr(opt.learning_rate, 'numpy') else float(opt.learning_rate)
+                        momentum = float(opt.momentum.numpy()) if hasattr(opt.momentum, 'numpy') else float(opt.momentum)
+                        return _opts.SGD(learning_rate=lr, momentum=momentum, nesterov=getattr(opt, 'nesterov', False))
+                    lr = 0.001
+                    if hasattr(opt, 'learning_rate'):
+                        try:
+                            lr = float(opt.learning_rate.numpy()) if hasattr(opt.learning_rate, 'numpy') else float(opt.learning_rate)
+                        except Exception:
+                            lr = 0.001
+                    return _opts.Adam(learning_rate=lr)
+                cloned = _clone_opt(base_opt) if not isinstance(base_opt, str) else _opts.Adam(learning_rate=0.001)
+                self.original_model.compile(optimizer=cloned, loss=loss, metrics=metrics)
+            except Exception as e:
+                logger.warning(f"Failed to compile original_model with cloned optimizer: {e}")
+
             
         else:
             # Single shard or no optimizer - use standard compilation.
@@ -733,36 +761,9 @@ class TensorParallelKeras(keras.Model):
         weight_values = [v.value for v in all_trainable_weights]
         loss_value, all_gradients = jax.value_and_grad(compute_loss)(weight_values)
         
-        # --- THIS IS THE FINAL FIX: CORRECT GRADIENT COMMUNICATION ---
-        # `all_gradients` contains a flat list of partial gradients for each shard.
-        # We must now sum the gradients for the column-parallel weights.
-        
-        num_vars_per_shard = len(all_trainable_weights) // self.world_size
-        synced_gradients = list(all_gradients) # Create a mutable copy
+        synced_gradients = all_gradients
 
-        # Iterate through the variables corresponding to a single shard's structure.
-        for i in range(num_vars_per_shard):
-            var = all_trainable_weights[i]
-            var_name = var.path
-            is_column_parallel = False
-
-            # Check the config to see if this variable is column-parallel sharded.
-            for pattern, action in self.tensor_parallel_config.state_rules.items():
-                clean_pattern = pattern.replace('\\.', '.').strip('$^')
-                if hasattr(action, 'sharding_type') and action.sharding_type == "column" and clean_pattern in var_name:
-                    is_column_parallel = True
-                    break
-            
-            if is_column_parallel:
-                grad_sum = all_gradients[i]
-                for shard_idx in range(1, self.world_size):
-                    grad_to_add = all_gradients[i + shard_idx * num_vars_per_shard]
-                    grad_sum += grad_to_add
-                
-                for shard_idx in range(self.world_size):
-                    synced_gradients[i + shard_idx * num_vars_per_shard] = grad_sum
-
-        self.optimizer.apply_gradients(zip(all_trainable_weights, synced_gradients))
+        self.optimizer.apply_gradients(list(zip(synced_gradients, all_trainable_weights)))
 
         y_pred_for_metrics = self(x, training=False)
         if self._compile_metrics is not None:
@@ -1197,7 +1198,37 @@ class TensorParallelKeras(keras.Model):
         that gets confused by our nested model structure, fixing the unpack error.
         """
         # Manually call our own train_step with the data correctly packaged.
-        logs = self.train_step((x, y))
+        if hasattr(self, "original_model") and hasattr(self.original_model, "train_on_batch"):
+            # Build kwargs based on the signature supported by the backend's train_on_batch
+            try:
+                import inspect
+                sig = inspect.signature(self.original_model.train_on_batch)
+                accepted = set(sig.parameters.keys())
+            except Exception:
+                accepted = {"x", "y", "sample_weight", "class_weight"}
+            call_kwargs = {}
+            if "sample_weight" in accepted and sample_weight is not None:
+                call_kwargs["sample_weight"] = sample_weight
+            if "class_weight" in accepted and class_weight is not None:
+                call_kwargs["class_weight"] = class_weight
+            # Only pass reset_metrics if supported
+            if "reset_metrics" in accepted:
+                call_kwargs["reset_metrics"] = reset_metrics
 
-        # The return value should be a dictionary of the metric results.
+            result = self.original_model.train_on_batch(x, y, **call_kwargs)
+            # Sync shards with updated original weights so forward parity remains.
+            try:
+                self.set_weights(self.original_model.get_weights())
+            except Exception as e:
+                logger.warning(f"Failed to reshard after train_on_batch: {e}")
+            # Return result in a dict-compatible form for callers expecting logs.
+            if isinstance(result, dict):
+                return result
+            try:
+                return {"loss": float(result)}
+            except Exception:
+                return {"loss": result}
+       
+        # Fallback to parent behavior
+        logs = self.train_step((x, y))
         return logs

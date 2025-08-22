@@ -738,7 +738,7 @@ class TensorParallelKeras(keras.Model):
         from keras import ops
         import numpy as np
 
-        # x, y = data
+        # Robustly unpack data potentially containing (x, y) or (x, y, sample_weight)
         sample_weight = None
         if isinstance(data, (list, tuple)):
             if len(data) == 3:
@@ -746,12 +746,14 @@ class TensorParallelKeras(keras.Model):
             elif len(data) == 2:
                 x, y = data
             else:
+                # Fallback: treat entire payload as x and set y to None
                 x, y = data, None
         elif isinstance(data, dict):
             x = data.get('x') if 'x' in data else data.get('inputs')
             y = data.get('y') if 'y' in data else data.get('targets')
             sample_weight = data.get('sample_weight')
         else:
+            # Unknown structure; assume it's inputs only
             x, y = data, None
 
         all_trainable_weights = self.trainable_weights
@@ -764,14 +766,13 @@ class TensorParallelKeras(keras.Model):
                 var.assign(value)
 
             y_pred = self(x, training=True)
-            # loss = self.compute_loss(y=y, y_pred=y_pred)
-
             if y is not None:
                 if sample_weight is not None:
                     loss = self.compute_loss(y=y, y_pred=y_pred, sample_weight=sample_weight)
                 else:
                     loss = self.compute_loss(y=y, y_pred=y_pred)
             else:
+                # If no labels provided, compute a dummy loss as mean of predictions
                 loss = ops.mean(y_pred)
 
             for var, value in zip(all_trainable_weights, original_values):
@@ -788,8 +789,6 @@ class TensorParallelKeras(keras.Model):
         self.optimizer.apply_gradients(list(zip(synced_gradients, all_trainable_weights)))
 
         y_pred_for_metrics = self(x, training=False)
-        # if self._compile_metrics is not None:
-        #     self._compile_metrics.update_state(y, y_pred_for_metrics)
         if self._compile_metrics is not None and y is not None:
             if sample_weight is not None:
                 self._compile_metrics.update_state(y, y_pred_for_metrics, sample_weight=sample_weight)

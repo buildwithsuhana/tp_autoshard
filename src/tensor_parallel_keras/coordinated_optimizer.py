@@ -732,7 +732,42 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         """Set optimizer weights."""
         return self.coordinated_optimizer.set_weights(weights)
     
-    def update_step(self, gradient, variable):
-        """Required method for Keras optimizer compatibility."""
-        # This will be handled by the coordinated optimizer
-        pass 
+    def update_step(self, gradient, variable, *args, **kwargs):
+        if hasattr(self.base_optimizer, 'update_step'):
+            try:
+                return self.base_optimizer.update_step(gradient, variable, *args, **kwargs)
+            except TypeError:
+                return self.base_optimizer.update_step(gradient, variable)
+        try:
+            return super().update_step(gradient, variable, *args, **kwargs)
+        except TypeError:
+            return super().update_step(gradient, variable)
+
+    def build(self, variables):
+        try:
+            if hasattr(self.base_optimizer, 'build'):
+                self.base_optimizer.build(variables)
+        except Exception:
+            pass
+        try:
+            return super().build(variables)
+        except Exception:
+            return None
+
+    def apply(self, gradients, variables=None, *args, **kwargs):
+        # Handle list of (grad, var) pairs
+        if variables is None and gradients and isinstance(gradients[0], tuple):
+            return self._apply_standard_gradients(gradients)
+        # Delegate to base optimizer.apply if it exists
+        if hasattr(self.base_optimizer, 'apply'):
+            try:
+                return self.base_optimizer.apply(gradients, variables, *args, **kwargs)
+            except TypeError:
+                pass
+        # Pair grads and vars if provided separately
+        if variables is not None:
+            gv = list(zip(gradients, variables))
+            return self._apply_standard_gradients(gv)
+        # Last resort: assume standard gv format
+        return self._apply_standard_gradients(gradients)
+    

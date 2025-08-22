@@ -5,7 +5,6 @@ Configuration classes for Keras Tensor Parallel
 import dataclasses
 from typing import Any, Callable, Dict, Optional, Sequence, Union
 
-import torch
 from keras import layers
 
 from .communications_keras import AllReduceKeras, AllGatherKeras, BroadcastKeras

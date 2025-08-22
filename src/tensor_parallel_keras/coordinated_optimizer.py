@@ -3,7 +3,10 @@ Coordinated Optimizer for Keras Tensor Parallel
 Coordinates parameter updates across multiple model shards
 """
 
-import torch
+try:
+    import torch  # type: ignore
+except Exception:  # torch is optional; allow JAX-only usage
+    torch = None  # type: ignore
 import numpy as np
 from typing import List, Dict, Any, Optional
 import keras
@@ -366,7 +369,7 @@ class CoordinatedOptimizer:
 
         return gradients_and_vars
     
-    def _allreduce_gradients(self, gradients: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _allreduce_gradients(self, gradients: List[Any]) -> List[Any]:
         """
         REAL AllReduce operation for gradients using distributed backend.
         
@@ -386,7 +389,7 @@ class CoordinatedOptimizer:
                 for grad in gradients:
                     if hasattr(grad, 'numpy'):
                         numpy_gradients.append(grad.numpy())
-                    elif isinstance(grad, torch.Tensor):
+                    elif (torch is not None) and isinstance(grad, torch.Tensor):
                         numpy_gradients.append(grad.cpu().numpy())
                     else:
                         numpy_gradients.append(np.array(grad))
@@ -396,11 +399,13 @@ class CoordinatedOptimizer:
                     numpy_gradients[0], op='mean'  # Use first gradient as representative
                 )
                 
-                # Convert back to PyTorch tensors
+                # Convert back to gradients matching the input type if possible
                 synchronized_gradients = []
                 for i in range(self.world_size):
-                    torch_grad = torch.tensor(synchronized_numpy)
-                    synchronized_gradients.append(torch_grad)
+                    if torch is not None:
+                        synchronized_gradients.append(torch.tensor(synchronized_numpy))
+                    else:
+                        synchronized_gradients.append(np.array(synchronized_numpy))
                 
                 logger.info(f"REAL AllReduce completed using {type(self.distributed_backend).__name__}")
                 return synchronized_gradients
@@ -412,7 +417,21 @@ class CoordinatedOptimizer:
         # Fallback: sophisticated simulation (not production-ready)
         logger.warning("Using SIMULATION for AllReduce - NOT production-ready!")
         
-        # Convert to PyTorch tensors if needed
+        # If torch is unavailable, simulate with NumPy arrays
+        if torch is None:
+            numpy_grads = []
+            for grad in gradients:
+                if hasattr(grad, 'numpy'):
+                    numpy_grads.append(grad.numpy())
+                else:
+                    numpy_grads.append(np.array(grad))
+            total = sum(numpy_grads)
+            mean_grad = total / float(self.world_size)
+            synchronized_gradients = [mean_grad for _ in range(self.world_size)]
+            logger.info("SIMULATION AllReduce (NumPy) completed for gradients")
+            return synchronized_gradients
+        
+        # If torch is available, continue with torch simulation
         torch_gradients = []
         for grad in gradients:
             if hasattr(grad, 'numpy'):
@@ -420,35 +439,11 @@ class CoordinatedOptimizer:
             elif isinstance(grad, torch.Tensor):
                 torch_gradients.append(grad)
             else:
-                # Fallback: convert to tensor
                 torch_gradients.append(torch.tensor(grad))
-        
-        # Step 1: Sum all gradients (Reduce phase)
         total = sum(torch_gradients)
-        
-        # Step 2: Compute average (AllReduce result)
         mean_grad = total / self.world_size
-        
-        # Step 3: Add realistic distributed computation noise
-        # This simulates the communication overhead and numerical differences
-        # you'd see in real distributed systems
-        
-        synchronized_gradients = []
-        for i in range(self.world_size):
-            # Add small noise to simulate real distributed computation
-            try:
-                noise_scale = 0.001 * mean_grad.abs().mean()
-                if noise_scale > 0:
-                    noise = torch.randn_like(mean_grad) * noise_scale
-                    synchronized_grad = mean_grad + noise
-                else:
-                    synchronized_grad = mean_grad.clone()
-            except:
-                synchronized_grad = mean_grad.clone()
-            
-            synchronized_gradients.append(synchronized_grad)
-        
-        logger.info(f"SIMULATION AllReduce completed for gradients with shape {mean_grad.shape}")
+        synchronized_gradients = [mean_grad.clone() for _ in range(self.world_size)]
+        logger.info(f"SIMULATION AllReduce (Torch) completed for gradients with shape {mean_grad.shape}")
         return synchronized_gradients
     
     def get_weights(self):

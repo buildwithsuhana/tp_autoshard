@@ -52,7 +52,7 @@ class ShardedWeight:
 
     def num_elements(self):
         """Returns the total number of elements in the tensor."""
-        return keras.ops.size(self._variable).numpy()
+        return keras.ops.size(self._variable)
 
     def __repr__(self):
         return (f"<ShardedWeight name='{self.name}' "

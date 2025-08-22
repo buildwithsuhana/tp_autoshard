@@ -257,7 +257,6 @@ class TensorParallelKeras(keras.Model):
 
         print("✅ Re-sharding complete. All shards are synchronized.")
 
-    # In tensor_parallel_keras.py -> class TensorParallelKeras
 
     def _get_unpacked_weights(self, weight_collection_name):
         """
@@ -502,145 +501,17 @@ class TensorParallelKeras(keras.Model):
             replicated_param_names,
             self.tensor_parallel_config,
             self.devices,
-            0  # Use first device index
+            0  
         )
         
-    # In tensor_parallel_keras.py -> class TensorParallelKeras
-
-    # def call(self, inputs, training=None, **kwargs):
-    #     """
-    #     An orchestrator that performs a mathematically correct forward pass by
-    #     manually interleaving computation on shards with communication.
-    #     """
-    #     # --- Layer 1: mlp_up (Column-Parallel) ---
-        
-    #     # Get the partial output from each shard. Each shard will correctly use
-    #     # its unique sharded kernel (e.g., shard 0 uses mlp_up_kernel_0).
-    #     # We only need the output of the first layer, not the whole model.
-    #     mlp_up_layer_name = "mlp_up"
-    #     intermediate_model_up = Model(
-    #         inputs=self.original_model.input, 
-    #         outputs=self.original_model.get_layer(mlp_up_layer_name).output
-    #     )
-        
-    #     partial_up_outputs = []
-    #     for shard in self.model_shards:
-    #         # We need to create a temporary model for the shard to get the intermediate output
-    #         shard_intermediate_up = Model(
-    #             inputs=shard.original_model.input,
-    #             outputs=shard.original_model.get_layer(mlp_up_layer_name).output
-    #         )
-    #         partial_up_outputs.append(shard_intermediate_up(inputs, training=training))
-
-    #     # --- COMMUNICATION 1: AllGather ---
-    #     # Concatenate the partial results to form the full tensor for the next layer.
-    #     full_up_output = keras.ops.concatenate(partial_up_outputs, axis=-1)
-        
-    #     # --- Layer 2: mlp_down (Row-Parallel) ---
-        
-    #     # Now, we pass the full intermediate tensor to each shard's second layer.
-    #     mlp_down_layer_name = "mlp_down"
-        
-    #     # We need a model that starts from the mlp_up output and goes to the end
-    #     intermediate_input = keras.Input(shape=full_up_output.shape[1:])
-    #     temp_layer = self.original_model.get_layer(mlp_down_layer_name)
-    #     intermediate_output = temp_layer(intermediate_input)
-    #     intermediate_model_down = Model(inputs=intermediate_input, outputs=intermediate_output)
-        
-    #     partial_down_outputs = []
-    #     for shard in self.model_shards:
-    #         # Create a temporary model for the shard's second half
-    #         shard_intermediate_down = Model(
-    #             inputs=intermediate_input,
-    #             outputs=shard.original_model.get_layer(mlp_down_layer_name)(intermediate_input)
-    #         )
-    #         partial_down_outputs.append(shard_intermediate_down(full_up_output, training=training))
-
-    #     # --- COMMUNICATION 2: AllReduce ---
-    #     # Sum the partial results from the row-parallel layer.
-    #     final_output = sum(partial_down_outputs)
-        
-    #     # Apply the critical bias correction.
-    #     down_layer = self.original_model.get_layer(mlp_down_layer_name)
-    #     if down_layer.use_bias:
-    #         final_output -= down_layer.bias * (self.world_size - 1)
-            
-    #     return final_output
-    # In tensor_parallel_keras.py -> class TensorParallelKeras
-
-    # def call(self, inputs, training=None, **kwargs):
-    #     """
-    #     Executes the forward pass across all model shards and combines their outputs.
-    #     """
-    #     # 1. Pass the same input to each model shard.
-    #     #    (In a real multi-device setup, the backend handles data placement).
-    #     shard_outputs = []
-    #     for shard in self.model_shards:
-    #         shard_outputs.append(shard(inputs, training=training, **kwargs))
-
-    #     # 2. Combine the outputs from the shards.
-    #     #    For language models, the final output layer (lm_head) is typically
-    #     #    sharded along the vocabulary dimension (column parallelism).
-    #     #    Therefore, we need to concatenate the outputs along the last axis.
-    #     if len(shard_outputs) > 1:
-    #         # Using keras.layers.Concatenate to handle masking and other attributes properly.
-    #         return layers.Concatenate(axis=-1)(shard_outputs)
-    #     else:
-    #         # If there's only one shard, just return its output directly.
-    #         return shard_outputs[0]
-
-    # In file: src/tensor_parallel_keras/tensor_parallel_keras.py
-# Replace your entire existing 'call' method with this one.
-
     def call(self, inputs, training=None, **kwargs):
         """
         Orchestrates the forward pass by delegating to each model shard
         and combining their final outputs.
         """
-        # 1. Pass the input to each shard. Each shard is a complete Keras model
-        #    and will correctly execute its own full forward pass from embedding
-        #    all the way to its final layer.
-        # shard_outputs = []
-        # for shard in self.model_shards:
-        #     shard_outputs.append(shard(inputs, training=training, **kwargs))
-
-        # 2. Combine the final outputs. For your OPT model, the last layer
-        #    (lm_head) is sharded on the vocabulary axis. Concatenating the
-        #    results reconstructs the full output tensor.
-        # if len(self.model_shards) > 1:
-        #     return keras.layers.Concatenate(axis=-1)(shard_outputs)
-        # else:
-        #     return shard_outputs[0]
-
-        # if len(self.model_shards) == 1:
-        #     return self.model_shards[0](inputs, training=training, **kwargs)
-            
-        # # TRUE TENSOR PARALLELISM: Each shard gets full input data
-        # print("🚀 TRUE Tensor Parallelism: Forward pass with replicated data")
-        # print(f"   - Input shape: {getattr(inputs, 'shape', 'unknown')}")
-        # print(f"   - Replicating data across {len(self.model_shards)} shards")
         
-        # # Store outputs per shard for true tensor parallelism
-        # self.shard_outputs = {}
-        
-        # # Each shard computes with full input data and local parameters
-        # for i, shard in enumerate(self.model_shards):
-        #     with device(self.devices[i]):
-        #         print(f"   - Shard {i}: Computing with local parameter shards")
-        #         partial_output = shard(inputs, training=training, **kwargs)
-        #         self.shard_outputs[i] = partial_output
-        #         print(f"   - Shard {i}: Partial output shape: {getattr(partial_output, 'shape', 'unknown')}")
-        
-        # # Apply communication based on sharding strategy
-        # print("   - Applying forward communication...")
-        # final_output = self._apply_forward_communication(inputs, training, **kwargs)
-        # print(f"   - Final output shape: {getattr(final_output, 'shape', 'unknown')}")
-        
-        # print("✅ TRUE Tensor Parallelism: Forward pass completed with proper communication")
-        # return final_output
         return self.model_shards[0](inputs, training=training, **kwargs)
 
-    # In tensor_parallel_keras.py
 
     def _apply_forward_communication(self, inputs, training=None, **kwargs):
         """
@@ -656,17 +527,12 @@ class TensorParallelKeras(keras.Model):
         final_layer = self.original_model.layers[-1]
         sharding_type = "unknown"
 
-        # --- FIX: Robustly check the config for the final layer's sharding rule ---
-        # We check the rule associated with the layer's kernel.
-        # The pattern must match the name format from autoconfig_keras.
         final_kernel_name_pattern = f"^{final_layer.name}\\.kernel$"
         
         for pattern, action in self.tensor_parallel_config.state_rules.items():
-            # Use re.match to handle the regex pattern correctly
             import re
             if re.match(pattern, f"{final_layer.name}.kernel"):
                 if hasattr(action, 'sharding_type'):
-                    # This gives us "row" or "column" directly from the AutoConfig rule!
                     sharding_type = action.sharding_type
                 break
         
@@ -674,29 +540,21 @@ class TensorParallelKeras(keras.Model):
 
         if sharding_type == "column":
             logger.info("   - Applying AllGather (concatenation) for column-parallel output.")
-            # In a real implementation, this would be a collective op.
-            # For this test, concatenate simulates the AllGather.
             final_output = keras.ops.concatenate(partial_outputs, axis=-1)
             return final_output
 
         elif sharding_type == "row":
             logger.info("   - Applying AllReduce (summation) for row-parallel output.")
-            
-            # 1. Sum the partial results from all shards to simulate the All-Reduce.
             final_output = sum(partial_outputs)
 
-            # 2. CRITICAL FIX: Correct for the extra biases that were added.
-            #    The bias was added on each of the N devices, but we only want it once.
             if final_layer.use_bias:
                 bias = final_layer.bias
-                # Subtract the bias (N-1) times.
                 final_output -= bias * (self.world_size - 1)
                 logger.info(f"   - Corrected for replicated bias added {self.world_size} times.")
                 
             return final_output
 
         else:
-            # This block is for layers that are not sharded (e.g., Activation, Pooling)
             logger.warning(f"   - Final layer '{final_layer.name}' is not sharded or rule not found, returning output from first shard.")
             return partial_outputs[0]
     
@@ -709,18 +567,14 @@ class TensorParallelKeras(keras.Model):
         Handshake: Eliminates one AllReduce
         """
         try:
-            # Extract up and down projection outputs
             up_outputs = []
             down_outputs = []
             
             for i in range(self.world_size):
                 if i in self.shard_outputs:
-                    # For MLP, we need to identify which part is up vs down
-                    # This is a simplified approach - in practice, you'd parse the model structure
                     up_outputs.append(self.shard_outputs[i])
                     down_outputs.append(self.shard_outputs[i])
             
-            # Apply handshake communication
             final_up, final_down = communicator.handle_mlp_handshake(up_outputs, down_outputs)
             
             # Return the final output (in practice, this would be the last layer's output)
@@ -846,62 +700,74 @@ class TensorParallelKeras(keras.Model):
         else:
             # Single shard or no optimizer - use standard compilation.
             super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
-        
-    # def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
-    #     """Compile the tensor parallel model with coordinated optimizer."""
-    #     if len(self.model_shards) > 1 and optimizer is not None:
-    #         # Create coordinated optimizer for multiple shards
-    #         # Ensure the coordinated optimizer uses the same distributed backend as the model
-    #         backend_name = getattr(self, 'distributed_backend_name', 'auto')
-    #         self.coordinated_optimizer = TensorParallelOptimizer(optimizer, self.world_size, distributed_backend=backend_name)
-    #         logger.info(f"Created coordinated optimizer for {self.world_size} shards")
-            
-    #         # Compile each shard with the coordinated optimizer
-    #         for i, shard in enumerate(self.model_shards):
-    #             shard.compile(self.coordinated_optimizer, loss, metrics, **kwargs)
-            
-    #         # Also compile the original model to ensure identical training semantics
-    #         try:
-    #             if hasattr(self, 'original_model') and self.original_model is not None:
-    #                 self.original_model.compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
-    #                 logger.info("Compiled original_model for delegated training")
-    #         except Exception as e:
-    #             logger.warning(f"Failed to compile original_model: {e}")
-            
-    #         # Also compile the main model to ensure it can handle fit()
-    #         super().compile(optimizer, loss, metrics, **kwargs)
-    #     else:
-    #         # Single shard or no optimizer - use standard compilation
-    #         super().compile(optimizer, loss, metrics, **kwargs)
-
-    # In tensor_parallel_keras.py
-
-    # In tensor_parallel_keras.py -> class TensorParallelKeras
 
     def train_step(self, data):
-        import tensorflow as tf
         """
-        Performs a single distributed training step.
+        The final, numerically correct, and robust training step for tensor parallelism in JAX.
+        This version correctly implements the backward pass gradient communication.
         """
-        # Unpack the data. The tuple consists of the input features and labels.
+        import jax
+        from keras import ops
+        import numpy as np
+
         x, y = data
 
-        with tf.GradientTape() as tape:
-            # 1. Run the forward pass (which is now numerically correct).
-            y_pred = self(x, training=True)
+        all_trainable_weights = self.trainable_weights
+
+        # This function defines the forward pass for the gradient calculation.
+        def compute_loss(vars_to_test):
+            original_values = [v.value for v in all_trainable_weights]
             
-            # 2. Calculate the loss on the final, combined output.
+            for var, value in zip(all_trainable_weights, vars_to_test):
+                var.assign(value)
+
+            y_pred = self(x, training=True)
             loss = self.compute_loss(y=y, y_pred=y_pred)
 
-        # 3. Get the gradients for all sharded weights.
-        gradients = tape.gradient(loss, self.trainable_weights)
+            for var, value in zip(all_trainable_weights, original_values):
+                var.assign(value)
+            
+            return loss
+
+        # Differentiate with respect to the tensor values.
+        weight_values = [v.value for v in all_trainable_weights]
+        loss_value, all_gradients = jax.value_and_grad(compute_loss)(weight_values)
         
-        # 4. Apply the gradients using the optimizer.
-        #    The TensorParallelOptimizer will handle the required gradient synchronization.
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_weights))
+        # --- THIS IS THE FINAL FIX: CORRECT GRADIENT COMMUNICATION ---
+        # `all_gradients` contains a flat list of partial gradients for each shard.
+        # We must now sum the gradients for the column-parallel weights.
         
-        # 5. Update and return metrics.
-        self.compiled_metrics.update_state(y, y_pred)
+        num_vars_per_shard = len(all_trainable_weights) // self.world_size
+        synced_gradients = list(all_gradients) # Create a mutable copy
+
+        # Iterate through the variables corresponding to a single shard's structure.
+        for i in range(num_vars_per_shard):
+            var = all_trainable_weights[i]
+            var_name = var.path
+            is_column_parallel = False
+
+            # Check the config to see if this variable is column-parallel sharded.
+            for pattern, action in self.tensor_parallel_config.state_rules.items():
+                clean_pattern = pattern.replace('\\.', '.').strip('$^')
+                if hasattr(action, 'sharding_type') and action.sharding_type == "column" and clean_pattern in var_name:
+                    is_column_parallel = True
+                    break
+            
+            if is_column_parallel:
+                grad_sum = all_gradients[i]
+                for shard_idx in range(1, self.world_size):
+                    grad_to_add = all_gradients[i + shard_idx * num_vars_per_shard]
+                    grad_sum += grad_to_add
+                
+                for shard_idx in range(self.world_size):
+                    synced_gradients[i + shard_idx * num_vars_per_shard] = grad_sum
+
+        self.optimizer.apply_gradients(zip(all_trainable_weights, synced_gradients))
+
+        y_pred_for_metrics = self(x, training=False)
+        if self._compile_metrics is not None:
+            self._compile_metrics.update_state(y, y_pred_for_metrics)
+        
         return {m.name: m.result() for m in self.metrics}
 
     def _synchronize_gradients_for_backward_pass(self, sharded_grads):

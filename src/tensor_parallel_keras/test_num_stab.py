@@ -16,7 +16,8 @@ BATCH_SIZE = 8
 SEQ_LEN = 16
 INPUT_DIM = 64
 MLP_DIM = 256
-TOLERANCE = 1e-6
+TOLERANCE = 1e-20
+
 
 def build_test_model():
     """Builds a simple two-layer MLP for testing."""

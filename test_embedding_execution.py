@@ -62,8 +62,8 @@ def test_embedding_execution():
     
     if shape_match:
         # Convert to numpy for comparison
-        single_np = single_output.numpy()
-        tp_np = tp_output.numpy()
+        single_np = np.array(single_output)
+        tp_np = np.array(tp_output)
         
         # Calculate differences
         abs_diff = np.abs(single_np - tp_np)

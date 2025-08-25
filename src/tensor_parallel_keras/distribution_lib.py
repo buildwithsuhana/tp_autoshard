@@ -1,7 +1,8 @@
 """
 Distribution Library for Tensor Parallel Keras.
 
-This module provides device detection and management using Keras APIs.
+This module provides device detection and management.
+It's updated to correctly detect simulated devices for the JAX backend.
 """
 
 import logging
@@ -12,21 +13,41 @@ logger = logging.getLogger(__name__)
 
 def list_devices() -> List[str]:
     """
-    List all available devices using Keras APIs.
+    List all available devices.
+    
+    This function is updated to correctly detect simulated devices when
+    using the JAX backend with flags like XLA_FLAGS. It falls back to
+    checking physical devices for other backends.
     
     Returns:
         List of device identifiers in priority order (TPU > GPU > CPU)
     """
+    # --- MODIFICATION START ---
+    # Check for JAX backend first to correctly handle simulated devices.
+    if keras.backend.backend() == 'jax':
+        try:
+            import jax
+            # jax.devices() correctly reports all devices, including simulated ones.
+            jax_devices = jax.devices()
+            if jax_devices:
+                logger.info(f"JAX backend detected, found {len(jax_devices)} devices via jax.devices()")
+                # Format device names to be consistent (e.g., 'cpu:0', 'gpu:1')
+                formatted_devices = [f"{d.platform.lower()}:{d.id}" for d in jax_devices]
+                return formatted_devices
+        except (ImportError, Exception) as e:
+            logger.warning(f"Could not use jax.devices() to detect devices: {e}")
+            # Fall through to the standard method if JAX check fails.
+    # --- MODIFICATION END ---
+    
+    # Original fallback logic for non-JAX backends or if JAX check fails.
     devices = []
     
-    # Check for TPU devices first (highest priority)
+    # Check for TPU devices
     try:
         tpu_devices = keras.config.list_physical_devices('TPU')
         if tpu_devices:
             logger.info(f"Found {len(tpu_devices)} TPU devices")
-            for i, device in enumerate(tpu_devices):
-                devices.append(f"tpu:{i}")
-                logger.info(f"  TPU device {i}: {device}")
+            devices.extend([f"tpu:{i}" for i in range(len(tpu_devices))])
     except Exception as e:
         logger.debug(f"TPU detection failed: {e}")
     
@@ -35,9 +56,7 @@ def list_devices() -> List[str]:
         gpu_devices = keras.config.list_physical_devices('GPU')
         if gpu_devices:
             logger.info(f"Found {len(gpu_devices)} GPU devices")
-            for i, device in enumerate(gpu_devices):
-                devices.append(f"gpu:{i}")
-                logger.info(f"  GPU device {i}: {device}")
+            devices.extend([f"gpu:{i}" for i in range(len(gpu_devices))])
     except Exception as e:
         logger.debug(f"GPU detection failed: {e}")
     
@@ -46,18 +65,16 @@ def list_devices() -> List[str]:
         cpu_devices = keras.config.list_physical_devices('CPU')
         if cpu_devices:
             logger.info(f"Found {len(cpu_devices)} CPU devices")
-            for i, device in enumerate(cpu_devices):
-                devices.append(f"cpu:{i}")
-                logger.info(f"  CPU device {i}: {device}")
+            devices.extend([f"cpu:{i}" for i in range(len(cpu_devices))])
     except Exception as e:
         logger.debug(f"CPU detection failed: {e}")
     
     # If no devices found, add default CPU
     if not devices:
-        logger.warning("No devices detected, using default CPU")
+        logger.warning("No physical devices detected, using default CPU")
         devices.append("cpu:0")
     
-    logger.info(f"Total available devices: {len(devices)}")
+    logger.info(f"Total available devices via physical scan: {len(devices)}")
     return devices
 
 def get_device_info(device_id: str) -> Dict[str, any]:
@@ -82,20 +99,9 @@ def get_device_info(device_id: str) -> Dict[str, any]:
         if device_id.startswith('gpu:'):
             device_info['type'] = 'GPU'
             device_info['index'] = int(device_id.split(':')[1])
-            
-            # Get GPU memory info if available
-            try:
-                import tensorflow as tf
-                gpus = tf.config.experimental.list_physical_devices('GPU')
-                if device_info['index'] < len(gpus):
-                    device_info['memory'] = 'Available'  # Could add actual memory info
-            except:
-                pass
-                
         elif device_id.startswith('tpu:'):
             device_info['type'] = 'TPU'
             device_info['index'] = int(device_id.split(':')[1])
-            
         elif device_id.startswith('cpu:'):
             device_info['type'] = 'CPU'
             device_info['index'] = int(device_id.split(':')[1])
@@ -124,7 +130,6 @@ def get_best_devices(count: int = 1) -> List[str]:
         logger.warning(f"Requested {count} devices but only {len(all_devices)} available")
         count = len(all_devices)
     
-    # Return devices in priority order (TPU > GPU > CPU)
     return all_devices[:count]
 
 def get_device_backend(device_type: str) -> str:
@@ -138,9 +143,9 @@ def get_device_backend(device_type: str) -> str:
         Recommended backend name
     """
     backend_mapping = {
-        'tpu': 'jax',      # JAX is best for TPU
-        'gpu': 'nccl',     # NCCL is best for GPU
-        'cpu': 'tensorflow' # TensorFlow is good for CPU
+        'tpu': 'jax',
+        'gpu': 'nccl',
+        'cpu': 'tensorflow'
     }
     
     return backend_mapping.get(device_type.lower(), 'auto')
@@ -174,23 +179,11 @@ def get_device_memory_info(device_id: str) -> Optional[Dict[str, any]]:
     """
     try:
         if device_id.startswith('gpu:'):
-            # Try to get GPU memory info
-            try:
-                import tensorflow as tf
-                gpus = tf.config.experimental.list_physical_devices('GPU')
-                index = int(device_id.split(':')[1])
-                if index < len(gpus):
-                    # Could add actual memory querying here
-                    return {'type': 'GPU', 'index': index, 'memory': 'Available'}
-            except:
-                pass
-                
+            return {'type': 'GPU', 'index': int(device_id.split(':')[1]), 'memory': 'Available'}
         elif device_id.startswith('tpu:'):
             return {'type': 'TPU', 'index': int(device_id.split(':')[1]), 'memory': 'TPU Memory'}
-            
         elif device_id.startswith('cpu:'):
             return {'type': 'CPU', 'index': int(device_id.split(':')[1]), 'memory': 'System RAM'}
-            
     except Exception as e:
         logger.debug(f"Failed to get memory info for {device_id}: {e}")
     
@@ -208,9 +201,7 @@ def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) 
         Configuration dictionary with devices, backend, and other settings
     """
     try:
-        from .distribution_lib import list_devices, get_device_info
-        
-        # Get all available devices
+        # Get all available devices using our updated function
         all_devices = list_devices()
         
         if not all_devices:
@@ -224,13 +215,6 @@ def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) 
         
         # Select the best devices
         selected_devices = all_devices[:world_size]
-        
-        # Get device types for information
-        device_types = set()
-        for device_id in selected_devices:
-            device_info = get_device_info(device_id)
-            device_type = device_info.get('type', '').lower()
-            device_types.add(device_type)
         
         # Use specified backend or default to 'auto'
         recommended_backend = backend if backend else 'auto'

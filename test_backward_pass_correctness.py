@@ -63,6 +63,9 @@ def test_backward_pass_correctness():
     print("\n🔧 Setting up Tensor Parallel model...")
     model_tp_base = create_simple_model(input_dim, output_dim)
     model_tp_base.set_weights(initial_weights)  # Ensure same starting point
+
+    optimizer_tp_base = Adam(learning_rate=0.001)
+    model_tp_base.compile(optimizer=optimizer_tp_base, loss=loss_fn)
     
     model_tp = TensorParallelKeras(model_tp_base, device_ids=devices)
     optimizer_tp = Adam(learning_rate=0.001)  # This will be wrapped by TensorParallelOptimizer
@@ -89,18 +92,19 @@ def test_backward_pass_correctness():
     print("\n🚀 Performing one training step...")
     
     print("   Training single-device model...")
-    history_single = model_single.train_on_batch(dummy_x, dummy_y)
+    # Keras train_on_batch returns loss, and optionally metrics. We only care about the loss here.
+    loss_single = model_single.train_on_batch(dummy_x, dummy_y, return_dict=False)
     
     print("   Training Tensor Parallel model...")
-    history_tp = model_tp.train_on_batch(dummy_x, dummy_y)
+    loss_tp = model_tp.train_on_batch(dummy_x, dummy_y, return_dict=False)
     
     # 6. Compare results
     print(f"\n🔍 Training Results:")
-    print(f"   Single-device loss: {history_single:.6f}")
-    print(f"   Tensor Parallel loss: {history_tp:.6f}")
+    print(f"   Single-device loss: {loss_single:.6f}")
+    print(f"   Tensor Parallel loss: {loss_tp:.6f}")
     
     # The losses should be identical
-    loss_diff = abs(history_single - history_tp)
+    loss_diff = abs(loss_single - loss_tp)
     if loss_diff > 1e-5:
         print(f"❌ Loss difference too large: {loss_diff:.2e}")
         return False
@@ -145,7 +149,7 @@ def test_multiple_training_steps():
     input_dim = 64
     output_dim = 8
     batch_size = 16
-    num_steps = 3  # Reduced for testing
+    num_steps = 3
     
     print(f"🔧 Setup: {num_steps} training steps")
     
@@ -164,13 +168,18 @@ def test_multiple_training_steps():
     model_tp_base.set_weights(initial_weights)
     
     # Compile models
-    optimizer = Adam(learning_rate=0.001)
+    optimizer_single = Adam(learning_rate=0.001)
     loss_fn = CategoricalCrossentropy()
     
-    model_single.compile(optimizer=optimizer, loss=loss_fn)
+    model_single.compile(optimizer=optimizer_single, loss=loss_fn)
+
+    # MODIFIED: Compile the base model before wrapping
+    optimizer_tp_base = Adam(learning_rate=0.001)
+    model_tp_base.compile(optimizer=optimizer_tp_base, loss=loss_fn)
     
     model_tp = TensorParallelKeras(model_tp_base, device_ids=devices)
-    model_tp.compile(optimizer=optimizer, loss=loss_fn)
+    optimizer_tp = Adam(learning_rate=0.001)
+    model_tp.compile(optimizer=optimizer_tp, loss=loss_fn)
     
     # Training loop
     print(f"🚀 Training for {num_steps} steps...")
@@ -178,50 +187,38 @@ def test_multiple_training_steps():
     for step in range(num_steps):
         print(f"   Step {step + 1}/{num_steps}")
         
-        try:
-            # Train both models
-            loss_single = model_single.train_on_batch(dummy_x, dummy_y)
-            loss_tp = model_tp.train_on_batch(dummy_x, dummy_y)
-            
-            # Compare losses
-            loss_diff = abs(loss_single - loss_tp)
-            if loss_diff > 1e-5:
-                print(f"      ❌ Loss mismatch at step {step + 1}: {loss_diff:.2e}")
-                return False
-            else:
-                print(f"      ✅ Losses match: {loss_single:.6f} vs {loss_tp:.6f}")
-                
-        except Exception as e:
-            print(f"      ⚠️  Training step {step + 1} failed: {e}")
-            print(f"      This may be due to eager execution issues - continuing with single step test")
-            return True  # Consider this a pass for now
+        # Train both models
+        loss_single = model_single.train_on_batch(dummy_x, dummy_y, return_dict=False)
+        loss_tp = model_tp.train_on_batch(dummy_x, dummy_y, return_dict=False)
+        
+        # Compare losses
+        loss_diff = abs(loss_single - loss_tp)
+        if loss_diff > 1e-5:
+            print(f"      ❌ Loss mismatch at step {step + 1}: {loss_diff:.2e}")
+            return False
+        else:
+            print(f"      ✅ Losses match: {loss_single:.6f} vs {loss_tp:.6f}")
     
     # Final weight comparison
     print("\n🔍 Final weight comparison...")
-    try:
-        weights_single_final = model_single.get_weights()
-        weights_tp_final = model_tp.original_model.get_weights()
-        
-        all_match = True
-        for i, (w_single, w_tp) in enumerate(zip(weights_single_final, weights_tp_final)):
-            if not np.allclose(w_single, w_tp, rtol=1e-5, atol=1e-5):
-                print(f"   ❌ Final weight {i} mismatch!")
-                all_match = False
-            else:
-                print(f"   ✅ Final weight {i}: matches")
-        
-        if all_match:
-            print("\n🎉 MULTIPLE STEPS TEST PASSED!")
-            print("✅ Tensor Parallelism maintains correctness over multiple training steps!")
-            return True
+    weights_single_final = model_single.get_weights()
+    weights_tp_final = model_tp.original_model.get_weights()
+    
+    all_match = True
+    for i, (w_single, w_tp) in enumerate(zip(weights_single_final, weights_tp_final)):
+        if not np.allclose(w_single, w_tp, rtol=1e-5, atol=1e-5):
+            print(f"   ❌ Final weight {i} mismatch!")
+            all_match = False
         else:
-            print("\n❌ MULTIPLE STEPS TEST FAILED!")
-            return False
-            
-    except Exception as e:
-        print(f"   ⚠️  Weight comparison failed: {e}")
-        print(f"   This may be due to eager execution issues")
-        return True  # Consider this a pass for now
+            print(f"   ✅ Final weight {i}: matches")
+    
+    if all_match:
+        print("\n🎉 MULTIPLE STEPS TEST PASSED!")
+        print("✅ Tensor Parallelism maintains correctness over multiple training steps!")
+        return True
+    else:
+        print("\n❌ MULTIPLE STEPS TEST FAILED!")
+        return False
 
 if __name__ == "__main__":
     print("🧪 COMPREHENSIVE BACKWARD PASS TESTING")
@@ -231,27 +228,18 @@ if __name__ == "__main__":
     test1_passed = test_backward_pass_correctness()
     
     if test1_passed:
-        print("\n🎉 SINGLE STEP TEST PASSED!")
-        print("✅ Tensor Parallelism backward pass is mathematically correct!")
-        
-        # Test 2: Multiple training steps (optional)
-        try:
-            test2_passed = test_multiple_training_steps()
-            if test2_passed:
-                print("\n🎉 MULTIPLE STEPS TEST ALSO PASSED!")
-                print("✅ Tensor Parallelism maintains correctness over multiple training steps!")
-            else:
-                print("\n⚠️  Multiple steps test had issues (may be due to eager execution)")
-        except Exception as e:
-            print(f"\n⚠️  Multiple steps test failed with error: {e}")
-            print("   This may be due to eager execution or other backend issues")
+        # Test 2: Multiple training steps
+        test2_passed = test_multiple_training_steps()
         
         print("\n" + "=" * 80)
-        print("🏆 CORE TEST PASSED!")
-        print("✅ Tensor Parallelism backward pass is mathematically correct!")
-        print("✅ The fundamental issue has been resolved!")
-        exit(0)
+        if test2_passed:
+            print("🏆 ALL TESTS PASSED!")
+            print("✅ Tensor Parallelism backward pass is mathematically correct!")
+            exit(0)
+        else:
+            print("❌ MULTIPLE STEP TEST FAILED!")
+            exit(1)
     else:
-        print("\n❌ Single step test failed!")
+        print("\n❌ SINGLE STEP TEST FAILED!")
         print("❌ Backward pass is still not mathematically correct!")
-        exit(1) 
+        exit(1)

@@ -35,28 +35,30 @@ class CoordinatedOptimizer:
     Implements true tensor parallelism by partitioning optimizer states across devices.
     """
     
-    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, 
-                 distributed_backend: str = 'auto', rank: int = 0, shard_optimizer_states: bool = True, tensor_parallel_config=None):
-        """
-        Initialize coordinated optimizer with sharded states.
+    # def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, 
+    #              distributed_backend: str = 'auto', rank: int = 0, shard_optimizer_states: bool = True, tensor_parallel_config=None):
+        # """
+        # Initialize coordinated optimizer with sharded states.
         
-        Args:
-            base_optimizer: Base Keras optimizer (e.g., Adam, SGD)
-            world_size: Number of model shards
-            distributed_backend: Backend to use ('auto', 'horovod', 'tensorflow', 'nccl', 'fallback')
-            rank: Process rank for distributed training
-            shard_optimizer_states: Whether to shard optimizer states across devices
-        """
+        # Args:
+        #     base_optimizer: Base Keras optimizer (e.g., Adam, SGD)
+        #     world_size: Number of model shards
+        #     distributed_backend: Backend to use ('auto', 'horovod', 'tensorflow', 'nccl', 'fallback')
+        #     rank: Process rank for distributed training
+        #     shard_optimizer_states: Whether to shard optimizer states across devices
+        # """
+    def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int,
+                 distributed_backend: str = 'auto', rank: int = 0, shard_optimizer_states: bool = True, tensor_parallel_config=None):
+        print("✅ --- Executing NEW CoordinatedOptimizer Code --- ✅") # <-- ADD THIS LINE
+
         self.base_optimizer = base_optimizer
         self.world_size = world_size
         self.rank = rank
         self.shard_optimizer_states = shard_optimizer_states
-        self.param_groups = []
-        self.state = {}
         self.tensor_parallel_config = tensor_parallel_config
-        
-        # Initialize distributed backend
-        if get_distributed_backend is not None:
+        self.sharded_states = {}
+
+        if get_distributed_backend:
             try:
                 self.distributed_backend = get_distributed_backend(distributed_backend, world_size, rank)
                 logger.info(f"Using distributed backend: {type(self.distributed_backend).__name__}")
@@ -67,72 +69,74 @@ class CoordinatedOptimizer:
             self.distributed_backend = None
             logger.warning("Distributed backend not available, using fallback")
         
-        # Create optimizer for each shard
-        self.shard_optimizers = []
-        self.sharded_states = {}  # Store sharded optimizer states
-        
-        for i in range(world_size):
-            # Clone the base optimizer for each shard
-            if isinstance(base_optimizer, optimizers.Adam):
-                # Extract learning rate value from variable
-                lr = float(base_optimizer.learning_rate.numpy()) if hasattr(base_optimizer.learning_rate, 'numpy') else 0.001
-                beta_1 = float(base_optimizer.beta_1.numpy()) if hasattr(base_optimizer.beta_1, 'numpy') else 0.9
-                beta_2 = float(base_optimizer.beta_2.numpy()) if hasattr(base_optimizer.beta_2, 'numpy') else 0.999
-                epsilon = float(base_optimizer.epsilon.numpy()) if hasattr(base_optimizer.epsilon, 'numpy') else 1e-7
-                
-                shard_opt = optimizers.Adam(
-                    learning_rate=lr,
-                    beta_1=beta_1,
-                    beta_2=beta_2,
-                    epsilon=epsilon,
-                    amsgrad=getattr(base_optimizer, 'amsgrad', False)
-                )
-            elif isinstance(base_optimizer, optimizers.SGD):
-                # Extract learning rate and momentum values
-                lr = float(base_optimizer.learning_rate.numpy()) if hasattr(base_optimizer.learning_rate, 'numpy') else 0.001
-                momentum = float(base_optimizer.momentum.numpy()) if hasattr(base_optimizer.momentum, 'numpy') else 0.0
-                
-                shard_opt = optimizers.SGD(
-                    learning_rate=lr,
-                    momentum=momentum,
-                    nesterov=getattr(base_optimizer, 'nesterov', False)
-                )
-            else:
-                # For other optimizers, try to clone with basic parameters
-                lr = 0.001
-                if hasattr(base_optimizer, 'learning_rate'):
-                    try:
-                        lr = float(base_optimizer.learning_rate.numpy())
-                    except:
-                        lr = 0.001
-                
-                shard_opt = type(base_optimizer)(
-                    learning_rate=lr
-                )
-            
-            self.shard_optimizers.append(shard_opt)
-        
-        # Initialize sharded optimizer states if enabled
+        # --- MAJOR CHANGE ---
+        # The base_optimizer MUST be built before we can inspect its state.
+        # We now initialize sharded states right after, using the real variables.
         if self.shard_optimizer_states:
-            self._initialize_sharded_states()
+            if not getattr(self.base_optimizer, 'built', False):
+                logger.error("Optimizer state sharding requires a pre-built base_optimizer. "
+                             "The base optimizer has no variables to shard.")
+                self.shard_optimizer_states = False
+            else:
+                self._initialize_sharded_states()
+
+    def _get_actual_optimizer_state(self) -> Dict[str, Any]:
+        """
+        [NEW METHOD] Inspects a PRE-BUILT optimizer and extracts its actual state variables
+        into the nested dictionary format this class expects.
+        """
+        state_dict = {}
+        # Keras optimizers store state variables in a flat list. We need to group them.
+        # Variable names are often like 'Adam/m/dense_1/kernel:0'.
+        
+        for var in self.base_optimizer.variables:
+            name_parts = var.name.split('/')
+            
+            # Handle scalar variables like 'iterations' or the step counter 't'
+            if len(name_parts) == 1 or 'iteration' in var.name.lower():
+                state_dict['t'] = var
+                continue
+
+            if len(name_parts) < 3:
+                logger.warning(f"Could not parse optimizer variable name: {var.name}")
+                continue
+
+            # e.g., 'm' or 'v' for Adam, 'momentum' for SGD
+            state_name = name_parts[1]
+            
+            # Reconstruct the parameter name, e.g., 'dense/kernel'
+            param_name = '/'.join(name_parts[2:]).split(':')[0]
+
+            if state_name not in state_dict:
+                state_dict[state_name] = {}
+            
+            state_dict[state_name][param_name] = var
+        
+        return state_dict
     
     def _initialize_sharded_states(self):
         """Initialize sharded optimizer states across devices."""
         logger.info("Initializing sharded optimizer states...")
         
         try:
-            # Get the base optimizer's state structure
-            base_state = self._get_base_optimizer_state_structure()
+            # --- FIX ---
+            # Get the optimizer's ACTUAL state, not a dummy structure
+            base_state = self._get_actual_optimizer_state()
             
+            if not base_state:
+                logger.error("Failed to get optimizer state. Aborting sharding.")
+                self.shard_optimizer_states = False
+                return
+
             # Partition states across devices
             for state_name, state_value in base_state.items():
                 if isinstance(state_value, dict):
                     # Handle nested state structures (e.g., Adam's m, v)
                     self.sharded_states[state_name] = {}
-                    for param_name, param_state in state_value.items():
-                        self.sharded_states[state_name][param_name] = self._partition_state_across_shards(param_state)
+                    for param_name, param_state_var in state_value.items():
+                        self.sharded_states[state_name][param_name] = self._partition_state_across_shards(param_state_var)
                 else:
-                    # Handle simple state values
+                    # Handle simple state values (like the 't' counter)
                     self.sharded_states[state_name] = self._partition_state_across_shards(state_value)
             
             logger.info(f"Sharded optimizer states initialized: {list(self.sharded_states.keys())}")
@@ -181,33 +185,22 @@ class CoordinatedOptimizer:
             logger.warning(f"Could not determine optimizer state structure: {e}")
             return {'dummy': np.array([0.0])}
     
-    def _partition_state_across_shards(self, state_value):
+    def _partition_state_across_shards(self, state_variable):
         """Partition a single state value across shards."""
         try:
-            if hasattr(state_value, 'numpy'):
-                # Convert Keras variable to numpy
-                state_array = state_value.numpy()
-            else:
-                state_array = np.array(state_value)
+            # Convert Keras/JAX/TF variable to a numpy array for manipulation
+            state_array = np.array(state_variable)
             
-            # Simple partitioning: split along the first dimension
-            if len(state_array.shape) > 0:
-                chunk_size = max(1, state_array.shape[0] // self.world_size)
-                partitioned = []
-                
-                for i in range(self.world_size):
-                    start_idx = i * chunk_size
-                    end_idx = start_idx + chunk_size if i < self.world_size - 1 else state_array.shape[0]
-                    partitioned.append(state_array[start_idx:end_idx])
-                
-                return partitioned
+            # Split along the first dimension. If it's a scalar, it will be replicated.
+            if state_array.ndim > 0:
+                return np.array_split(state_array, self.world_size, axis=0)
             else:
-                # Scalar value: replicate across shards
+                # Replicate scalar values (like the iteration counter)
                 return [state_array] * self.world_size
                 
         except Exception as e:
-            logger.warning(f"Failed to partition state: {e}, replicating across shards")
-            return [state_value] * self.world_size
+            logger.warning(f"Failed to partition state '{getattr(state_variable, 'name', 'N/A')}': {e}, replicating.")
+            return [state_variable] * self.world_size
     
     def get_config(self):
         """Get optimizer configuration."""
@@ -561,6 +554,7 @@ class CoordinatedOptimizer:
                 'memory_savings': '0.00%',
                 'error': str(e)
             }
+
     
     def enable_optimizer_state_sharding(self):
         """Enable optimizer state sharding."""
@@ -585,44 +579,22 @@ class CoordinatedOptimizer:
     def _get_sharded_states_structure(self):
         """Get the structure of sharded states for analysis."""
         if not hasattr(self, 'sharded_states') or not self.sharded_states:
-            return {}
+            return {'error': 'States are not sharded or initialized.'}
         
         structure = {}
-        
         for state_name, state_info in self.sharded_states.items():
+            structure[state_name] = {}
             if isinstance(state_info, dict):
-                # Handle nested state structures (e.g., Adam's m and v)
-                structure[state_name] = {}
-                for var_name, var_states in state_info.items():
-                    if isinstance(var_states, list):
-                        num_shards = len(var_states)
-                        shard_shapes = []
-                        for shard_state in var_states:
-                            if hasattr(shard_state, 'shape'):
-                                shard_shapes.append(shard_state.shape)
-                            else:
-                                shard_shapes.append('unknown')
-                        
-                        structure[state_name][var_name] = {
-                            'num_shards': num_shards,
-                            'shard_shapes': shard_shapes
-                        }
-            else:
-                # Handle simple state structures
-                if isinstance(state_info, list):
-                    num_shards = len(state_info)
-                    shard_shapes = []
-                    for shard_state in state_info:
-                        if hasattr(shard_state, 'shape'):
-                            shard_shapes.append(shard_state.shape)
-                        else:
-                            shard_shapes.append('unknown')
-                    
-                    structure[state_name] = {
-                        'num_shards': num_shards,
-                        'shard_shapes': shard_shapes
+                for var_name, var_shards in state_info.items():
+                    structure[state_name][var_name] = {
+                        'num_shards': len(var_shards),
+                        'shard_shapes': [s.shape for s in var_shards]
                     }
-        
+            else:
+                 structure[state_name] = {
+                    'num_shards': len(state_info),
+                    'shard_shapes': [s.shape for s in state_info]
+                }
         return structure
 
 

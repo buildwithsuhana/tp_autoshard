@@ -1155,45 +1155,32 @@ class TensorParallelKeras(keras.Model):
 
     # In tensor_parallel_keras.py -> class TensorParallelKeras
 
-    def train_on_batch(self, x, y=None, sample_weight=None, class_weight=None, reset_metrics=True):
+    def train_on_batch(self, x, y=None, sample_weight=None, class_weight=None, **kwargs):
         """
-        Overrides the base training method to manually call our custom train_step.
-        
-        This bypasses the complex data-handling logic in the base Keras Model
-        that gets confused by our nested model structure, fixing the unpack error.
+        Overrides the base training method to delegate to the original model,
+        accepting and forwarding all Keras-compatible arguments.
         """
-        # Manually call our own train_step with the data correctly packaged.
-        if hasattr(self, "original_model") and hasattr(self.original_model, "train_on_batch"):
-            # Build kwargs based on the signature supported by the backend's train_on_batch
-            try:
-                import inspect
-                sig = inspect.signature(self.original_model.train_on_batch)
-                accepted = set(sig.parameters.keys())
-            except Exception:
-                accepted = {"x", "y", "sample_weight", "class_weight"}
-            call_kwargs = {}
-            if "sample_weight" in accepted and sample_weight is not None:
-                call_kwargs["sample_weight"] = sample_weight
-            if "class_weight" in accepted and class_weight is not None:
-                call_kwargs["class_weight"] = class_weight
-            # Only pass reset_metrics if supported
-            if "reset_metrics" in accepted:
-                call_kwargs["reset_metrics"] = reset_metrics
+        if not hasattr(self, "original_model"):
+            # Fallback if the original model isn't available
+            return super().train_on_batch(x, y, sample_weight, class_weight, **kwargs)
 
-            result = self.original_model.train_on_batch(x, y, **call_kwargs)
-            # Sync shards with updated original weights so forward parity remains.
-            try:
-                self.set_weights(self.original_model.get_weights())
-            except Exception as e:
-                logger.warning(f"Failed to reshard after train_on_batch: {e}")
-            # Return result in a dict-compatible form for callers expecting logs.
-            if isinstance(result, dict):
-                return result
-            try:
-                return {"loss": float(result)}
-            except Exception:
-                return {"loss": result}
-       
-        # Fallback to parent behavior
-        logs = self.train_step((x, y))
-        return logs
+        # Combine all provided arguments, including standard ones and kwargs
+        call_kwargs = kwargs
+        if sample_weight is not None:
+            call_kwargs['sample_weight'] = sample_weight
+        if class_weight is not None:
+            call_kwargs['class_weight'] = class_weight
+
+        # Delegate the training call to the underlying original model
+        result = self.original_model.train_on_batch(x, y, **call_kwargs)
+
+        # After training, re-shard the updated weights to keep all shards in sync
+        try:
+            self.set_weights(self.original_model.get_weights())
+        except Exception as e:
+            # It's better to log the full exception for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to reshard after train_on_batch: {e}", exc_info=True)
+            
+        return result

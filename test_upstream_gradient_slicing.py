@@ -116,7 +116,7 @@ def test_upstream_gradient_slicing():
     # Forward: AllGather
     forward_output = communicator.forward_column_parallel(shard_outputs, dim=-1)
     print(f"   - Forward AllGather output: {forward_output.shape}")
-    print(f"   - Forward output values:\n{forward_output.numpy()}")
+    print(f"   - Forward output values:\n{np.array(forward_output)}")
     
     # Simulate upstream gradient (from next layer)
     upstream_grad = tf.ones_like(forward_output) * 0.1

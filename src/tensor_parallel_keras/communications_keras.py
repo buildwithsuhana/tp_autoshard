@@ -35,33 +35,49 @@ def _clone_tensor(tensor):
 # In communications_keras.py
 
 def _cat_tensors(tensors, dim=-1):
-    """Concatenate tensors using backend-agnostic keras.ops."""
+    """
+    Safely concatenates a list of tensors from potentially different backends
+    by first converting them to a uniform format (NumPy arrays).
+    """
     if not tensors:
         return None
     if len(tensors) == 1:
         return tensors[0]
 
-    # --- FIX: Use keras.ops directly for a correct, backend-agnostic simulation ---
-    # This avoids calling the JAX-specific parallel operator.
     try:
+        # --- FIX: Convert all tensors to NumPy arrays for backend safety ---
+        numpy_tensors = []
+        for t in tensors:
+            # The .numpy() method is a common way to convert various tensor types
+            if hasattr(t, 'numpy'):
+                numpy_tensors.append(np.array(t))
+            # Fallback for objects that are already NumPy or need np.array()
+            else:
+                numpy_tensors.append(np.array(t))
+        
+        # Now, concatenate the uniform list of NumPy arrays
         # The 'axis' parameter in keras.ops.concatenate is equivalent to 'dim'
-        return keras.ops.concatenate(tensors, axis=dim)
+        return keras.ops.concatenate(numpy_tensors, axis=dim)
+        
     except Exception as e:
-        logger.error(f"Error in _cat_tensors using keras.ops.concatenate: {e}")
+        # Log the specific error to help with debugging backend issues
+        logger.error(f"Error during tensor conversion or concatenation in _cat_tensors: {e}")
         # Fallback to returning the first tensor if concatenation fails
         return tensors[0]
 
 def _sum_tensors(tensors):
-    """Sum tensors using centralized backend operations."""
+    """Sums a list of tensors element-wise."""
     if not tensors:
-        return tensors[0] if tensors else None
+        return None
     
-    tensor_lib = _get_tensor_lib(tensors[0])
-    backend = DistributedBackend(tensor_lib)
-    comm_ops = backend.get_communication_ops()
+    # Start with the first tensor
+    total = tensors[0]
     
-    # Use the centralized all_reduce operation
-    return comm_ops["all_reduce"](tensors[0], op="sum")  # Simplified for now
+    # Add the rest of the tensors in the list
+    for tensor in tensors[1:]:
+        total = keras.ops.add(total, tensor)
+        
+    return total
 
 
 class CollectiveOpKeras:

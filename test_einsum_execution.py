@@ -45,11 +45,14 @@ def test_einsum_execution():
     print(f"Model created with {len(model.layers)} layers")
     
     # Create tensor parallel model with JAX backend
-    tp_model = TensorParallelKeras(
+    tp_manager = TensorParallelKeras(
         model=model,
-        world_size=2,
-        distributed_backend='jax'  # Use JAX backend
+        device_ids=['cpu:0', 'cpu:1']
     )
+    print("   - Tensor parallel manager created")
+
+    # 2. Build the final, ASSEMBLED model from the manager
+    model_tp_assembled = tp_manager.build_assembled_model()
     print("Tensor parallel model created")
     
     # Create test input
@@ -61,7 +64,7 @@ def test_einsum_execution():
     print(f"Single device output shape: {single_output.shape}")
     
     # Run tensor parallel model
-    tp_output = tp_model(input_data)
+    tp_output = model_tp_assembled(input_data)
     print(f"Tensor parallel output shape: {tp_output.shape}")
     
     # Check shapes match

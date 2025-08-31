@@ -53,7 +53,6 @@ class ShardedKeras:
         shard = self.model_shards[shard_index]
         params = {}
         
-        # Extract parameters from the shard
         for layer in shard.layers:
             name = layer.name
             if hasattr(layer, 'weights') and layer.weights:
@@ -76,14 +75,10 @@ class ShardedKeras:
         """
         Apply sharding to the model parameters.
         """
-        # This method would implement the actual sharding logic
-        # For now, it's a placeholder
         pass
         
     def unshard_parameters(self):
         """
         Unshard parameters back to their original form.
         """
-        # This method would implement the unsharding logic
-        # For now, it's a placeholder
         pass 

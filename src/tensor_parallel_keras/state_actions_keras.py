@@ -24,9 +24,8 @@ class SplitKeras(StateActionKeras):
     def __init__(self, world_size: int, dim: int, sharding_type: str = "auto"):
         self.world_size = world_size
         self.dim = dim
-        self.sharding_type = sharding_type  # "auto", "row", "column"
+        self.sharding_type = sharding_type
         
-        # Auto-determine dimension based on sharding type if dim is -1
         if dim == -1 and sharding_type != "auto":
             if sharding_type == "row":
                 self.dim = 0
@@ -36,21 +35,17 @@ class SplitKeras(StateActionKeras):
     def __call__(self, tensor: Any, rank: int) -> Any:
         """Split tensor and return the portion for this rank."""
         if self.dim == -1:
-            # Use keras.ops.ndim instead of tensor.dim()
             dim = keras.ops.ndim(tensor) - 1
         else:
             dim = self.dim
             
-        # Calculate split sizes
         total_size = tensor.shape[dim]
         split_size = total_size // self.world_size
         remainder = total_size % self.world_size
         
-        # Calculate start and end indices for this rank
         start_idx = rank * split_size + min(rank, remainder)
         end_idx = start_idx + split_size + (1 if rank < remainder else 0)
         
-        # Slicing works natively on Keras tensors
         slices = [slice(None)] * keras.ops.ndim(tensor)
         slices[dim] = slice(start_idx, end_idx)
         return tensor[tuple(slices)]
@@ -62,7 +57,6 @@ class SplitKeras(StateActionKeras):
         else:
             dim = self.dim
             
-        # Use keras.ops.concatenate instead of torch.cat, with 'axis'
         return keras.ops.concatenate(tensors, axis=dim)
 
 
@@ -84,7 +78,6 @@ class GatherKeras(StateActionKeras):
         else:
             dim = self.dim
             
-        # Use keras.ops.concatenate instead of torch.cat, with 'axis'
         return keras.ops.concatenate(tensors, axis=dim)
 
 
@@ -100,5 +93,4 @@ class SumKeras(StateActionKeras):
         
     def undo(self, tensors: Sequence[Any]) -> Any:
         """Sum the tensors."""
-        # The built-in sum() works with Keras tensors by applying the '+' operator
         return sum(tensors)

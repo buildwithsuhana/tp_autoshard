@@ -4,19 +4,15 @@ Port of the PyTorch tensor_parallel library
 """
 
 import logging
-from typing import Any, Collection, Optional, Sequence, Union
+from typing import Collection, Optional, Sequence, Union
 
 import numpy as np
 import keras
-from keras import layers, Model
-
 from keras import device
 
 from .autoconfig_keras import get_default_config_keras
-from .config_keras import ConfigKeras
 from .parameter_sharding import make_parameter_sharded_model
 from .sharding_keras import ShardedKeras
-from .communications_keras import allgather_outputs
 from .coordinated_optimizer import TensorParallelOptimizer
 from .parameter_sharding import ShardedWeight
 
@@ -69,33 +65,27 @@ class TensorParallelKeras(keras.Model):
         super().__init__()
         
         print("=" * 50)
-        print("Amit - TensorParallelKeras __init__ called!")
+        print("TensorParallelKeras __init__ called!")
         print("=" * 50)
         
-        # Auto-detect world_size and device_ids if not provided
         if world_size is None:
             world_size, device_ids = self._auto_detect_parallelism()
         elif device_ids is None:
-            # Only auto-detect device_ids if world_size is specified
             device_ids = self._auto_configure_devices(world_size, distributed_backend)
         
         self.world_size = world_size
         self.device_ids = device_ids
-        self.sharding_strategy = "auto"  # Always use auto - it's the smartest choice!
+        self.sharding_strategy = "auto" 
         self.distributed_backend = distributed_backend
         
-        # Set default values for other parameters
 
-        self.tensor_parallel_config = None  # Will be auto-generated
-        self.distributed = True  # Enable distributed communication for multi-device scenarios
+        self.tensor_parallel_config = None  
+        self.distributed = True
         
-        # Initialize the Keras Model parent class
         super().__init__(**kwargs)
         
-        # Store original model
         self.original_model = model
         
-        # Calculate original parameter count
         original_params = 0
         for p in model.weights:
             if hasattr(p, 'shape') and hasattr(p.shape, 'num_elements'):
@@ -103,20 +93,15 @@ class TensorParallelKeras(keras.Model):
             elif hasattr(p, 'shape') and hasattr(p.shape, '__iter__'):
                 original_params += np.prod(p.shape)
             else:
-                # Fallback
                 try:
                     original_params += np.prod(p.shape)
                 except:
                     original_params += 1
         
-        # Process device IDs
-        device_ids = list(self.check_device_ids(device_ids))  # Convert to list for modification
-        
-        # If no device IDs specified, use auto-configuration
+        device_ids = list(self.check_device_ids(device_ids))
         if not device_ids:
             device_ids = self._auto_configure_devices(world_size, distributed_backend)
         
-        # Special handling for JAX backend: try to detect JAX devices
         if distributed_backend == 'jax':
             try:
                 from .distributed_backend import DistributedBackend
@@ -125,7 +110,6 @@ class TensorParallelKeras(keras.Model):
                 
                 if device_info['device_count'] >= world_size:
                     print(f"🔍 JAX backend detected: {device_info['device_count']} devices available")
-                    # Use standard CPU device format that Keras understands
                     jax_devices = [f"cpu:{i}" for i in range(world_size)]
                     print(f"🔍 Using JAX devices as CPU devices: {jax_devices}")
                     device_ids = jax_devices
@@ -134,42 +118,33 @@ class TensorParallelKeras(keras.Model):
             except Exception as e:
                 print(f"⚠️  JAX device detection failed: {e}, using fallback")
             
-        # Ensure device_ids match world_size
         if len(device_ids) != world_size:
             device_ids = self._adjust_device_list(device_ids, world_size)
             
-        # Store device information
         self.devices = device_ids
         self.device_ids = [self._get_device_index(x) for x in device_ids]
         self.world_size = world_size
         self.sharding_manager = None
         
-        # Handle single device case
         if len(device_ids) <= 1:
             self.model_shards = [model]
             if len(device_ids) == 1:
-                # Move model to specified device
                 with device(device_ids[0]):
                     self.model_shards[0] = model
             return
             
-        # Get tensor parallel configuration
         if self.tensor_parallel_config is None:
             self.tensor_parallel_config = get_default_config_keras(model, self.devices)
             logger.info(f"Using automatic config with auto sharding strategy: sharding individual Dense/Conv/Embedding layers")
         
-        # Create collective operations
         config_with_ops = self.tensor_parallel_config.create_collective_ops(self.devices, self.distributed)
         
-        # Create model shards
         self.model_shards = []
         self.modified_parameters_names = set()
         
-        # Create model shards using parameter-level sharding
         print(f"🔧 Creating model shards for {model.name}")
         
-        # Check if this is a multi-layer model
-        self._is_multi_layer_model = len(model.layers) > 2  # More than just Input + Output
+        self._is_multi_layer_model = len(model.layers) > 2
         if self._is_multi_layer_model:
             logger.info(f"   - Multi-layer model detected: {len(model.layers)} layers")
         
@@ -180,7 +155,6 @@ class TensorParallelKeras(keras.Model):
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
             
-        # Validate sharding
         params_per_shard = []
         for shard in self.model_shards:
             total_params = 0
@@ -192,7 +166,6 @@ class TensorParallelKeras(keras.Model):
                 elif hasattr(p.shape, 'num_elements'):
                     total_params += p.shape.num_elements()
                 else:
-                    # Fallback: calculate from shape
                     shape = p.shape
                     if hasattr(shape, '__iter__'):
                         total_params += np.prod(shape)
@@ -200,10 +173,8 @@ class TensorParallelKeras(keras.Model):
                         total_params += shape
             params_per_shard.append(total_params)
         
-        # Remember the distributed backend name requested so we can reuse it elsewhere (e.g., optimizers)
         self.distributed_backend_name = distributed_backend
 
-        # Initialize distributed backend for real communication
         try:
             from .distributed_backend import get_distributed_backend
             self.distributed_backend = get_distributed_backend(distributed_backend, self.world_size, rank=0)
@@ -220,21 +191,16 @@ class TensorParallelKeras(keras.Model):
         Sets the weights of the model and re-shards them across all devices.
         """
         if not self.built:
-            # A simple build call can prevent issues with unbuilt models.
             if self.original_model.input_shape:
                 self.build(self.original_model.input_shape)
             else:
-                # Fallback if input shape is not available
                 pass
 
-        # Set the weights on the internal original_model
         self.original_model.set_weights(weights)
         print("🔧 Weights set on original_model. Re-sharding parameters...")
 
-        # Re-create collective operations
         config_with_ops = self.tensor_parallel_config.create_collective_ops(self.devices, self.distributed)
 
-        # Re-create model shards with the new weights
         self.model_shards = []
         self.modified_parameters_names = set()
         for rank, device_id in enumerate(self.devices):
@@ -244,10 +210,8 @@ class TensorParallelKeras(keras.Model):
             self.model_shards.append(shard)
             self.modified_parameters_names.update(modified_parameters_names)
 
-        # Safely check if the model has been compiled before trying to re-compile shards
         if hasattr(self, "optimizer") and self.optimizer is not None:
             print("   - Re-compiling shards with new weights...")
-            # Keras 3 moved compiled attributes under the optimizer
             for shard in self.model_shards:
                 shard.compile(
                     optimizer=self.coordinated_optimizer,
@@ -263,28 +227,18 @@ class TensorParallelKeras(keras.Model):
         A helper function to robustly unpack weights from ALL shards and ensure
         they are compatible with the Keras backend.
         """
-        # --- FIX STARTS HERE ---
-        # The original code iterated over `self.layers`, which is empty.
-        # The fix is to iterate over all model_shards and collect their weights.
         if not self.model_shards:
             return []
 
         all_weights = []
-        # Iterate through the weights of ALL shards to build a complete list.
         for shard in self.model_shards:
-            # The shard is a ParameterShardedModel, which has a `weights` property
-            # that returns the correct list of ShardedWeight objects and regular weights.
             weight_collection = getattr(shard, weight_collection_name)
             all_weights.extend(weight_collection)
-        # --- FIX ENDS HERE ---
 
         unpacked_weights = []
-        # Now, unpack the collected weights from the combined list.
         for weight in all_weights:
-            # If a weight is our custom wrapper, unpack the underlying variable.
             final_weight = weight.variable if isinstance(weight, ShardedWeight) else weight
 
-            # Keras expects this attribute for certain operations.
             if not hasattr(final_weight, 'regularizer'):
                 final_weight.regularizer = None
 
@@ -577,7 +531,6 @@ class TensorParallelKeras(keras.Model):
             
             final_up, final_down = communicator.handle_mlp_handshake(up_outputs, down_outputs)
             
-            # Return the final output (in practice, this would be the last layer's output)
             return final_down[0] if isinstance(final_down, list) else final_down
             
         except Exception as e:
@@ -593,21 +546,13 @@ class TensorParallelKeras(keras.Model):
             if not partial_outputs:
                 return None
 
-            # 1. Sum the partial results from all shards (simulating All-Reduce).
-            # This correctly combines the matrix multiplication results but
-            # also sums the bias `world_size` times.
             final_output = sum(partial_outputs)
-
-            # 2. Correct for the extra biases that were added.
-            # Find the final layer of the original model to get its bias.
             final_layer = self.original_model.layers[-1]
             if final_layer.use_bias:
                 bias = final_layer.bias
                 
-                # --- THIS IS THE CRITICAL CORRECTION ---
                 final_output -= bias * (self.world_size - 1)
                 
-                # You can add this print statement for debugging to ensure this line is running
                 print(f"   - DEBUG: Corrected for bias added {self.world_size} times.")
 
             logger.info(f"   - Summed {len(partial_outputs)} partial outputs and corrected for replicated bias.")
@@ -620,24 +565,19 @@ class TensorParallelKeras(keras.Model):
     def _get_expected_output_dimension(self):
         """Get the expected output dimension for the original model."""
         try:
-            # This is a simplified approach - in practice, you'd get this from the original model
             if hasattr(self, 'original_model') and self.original_model is not None:
-                # Try to get output shape from original model
                 if hasattr(self.original_model, 'output_shape'):
                     return self.original_model.output_shape[-1]
                 elif hasattr(self.original_model, 'layers') and self.original_model.layers:
-                    # Get from last layer
                     last_layer = self.original_model.layers[-1]
                     if hasattr(last_layer, 'units'):
                         return last_layer.units
                     elif hasattr(last_layer, 'output_shape'):
                         return last_layer.output_shape[-1]
             
-            # Fallback: estimate from shard outputs
             if hasattr(self, 'shard_outputs') and self.shard_outputs:
                 first_output = self.shard_outputs[0]
                 if hasattr(first_output, 'shape') and len(first_output.shape) >= 2:
-                    # Estimate: multiply by world size for column-parallel
                     return first_output.shape[-1] * self.world_size
             
             return None
@@ -666,11 +606,6 @@ class TensorParallelKeras(keras.Model):
             
         except Exception as e:
             logger.warning(f"Gradient synchronization setup failed: {e}")
-            # Continue training even if synchronization fails
-
-    # In tensor_parallel_keras.py -> class TensorParallelKeras
-
-    # In tensor_parallel_keras.py -> class TensorParallelKeras
 
     def compile(self, optimizer=None, loss=None, metrics=None, **kwargs):
         """
@@ -679,27 +614,20 @@ class TensorParallelKeras(keras.Model):
         and then compiles the main model with it.
         """
         if len(self.model_shards) > 1 and optimizer is not None:
-            # 1. Create the coordinated optimizer wrapper.
             if len(self.model_shards) > 1 and optimizer is not None:
-                # 1. Create the coordinated optimizer wrapper.
                 backend_name = getattr(self, 'distributed_backend_name', 'auto')
                 
-                # --- FIX: Pass the tensor_parallel_config into the optimizer ---
                 coordinated_optimizer = TensorParallelOptimizer(
                     optimizer, 
                     self.world_size, 
                     distributed_backend=backend_name,
-                    tensor_parallel_config=self.tensor_parallel_config  # Add this line
+                    tensor_parallel_config=self.tensor_parallel_config
         )
                 self.coordinated_optimizer = coordinated_optimizer
             logger.info(f"Wrapped optimizer with TensorParallelOptimizer for {self.world_size} shards.")
-            
-            # 2. Compile the main parent model with the WRAPPED optimizer.
-            #    Do NOT compile the individual shards. Keras handles this.
             super().compile(optimizer=self.coordinated_optimizer, loss=loss, metrics=metrics, **kwargs)
             try:
                 base_opt = optimizer
-                import keras
                 from keras import optimizers as _opts
                 def _clone_opt(opt):
                     if isinstance(opt, _opts.Adam):
@@ -726,7 +654,6 @@ class TensorParallelKeras(keras.Model):
 
             
         else:
-            # Single shard or no optimizer - use standard compilation.
             super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
 
     def train_step(self, data, *args, **kwargs):
@@ -740,27 +667,14 @@ class TensorParallelKeras(keras.Model):
         """
         Simulates the All-Reduce required for row-parallel layer gradients.
         """
-        # In a real distributed setup, this would perform a real All-Reduce.
-        # Here, we simulate it for our 2-shard MLP model.
-
-        # The model's trainable weights are ordered:
-        # [mlp_up_kernel_shard0, mlp_up_bias_shard0, mlp_down_kernel_shard0,
-        #  mlp_up_kernel_shard1, mlp_up_bias_shard1, mlp_down_kernel_shard1]
-        # We need to find the gradients for the row-parallel layer (`mlp_down`)
-        # and sum them across shards.
-
-        # This is a simplified mapping for the test case. A robust implementation
-        # would use the sharding config to identify which gradients to reduce.
         grad_mlp_down_shard0 = sharded_grads[2]
         grad_mlp_down_shard1 = sharded_grads[5]
         
-        # All-Reduce: Sum the partial gradients for the row-parallel layer
         synced_grad_mlp_down = grad_mlp_down_shard0 + grad_mlp_down_shard1
         
-        # Create the final list of gradients to be applied
         final_grads = list(sharded_grads)
         final_grads[2] = synced_grad_mlp_down
-        final_grads[5] = synced_grad_mlp_down # Both optimizers get the same synced grad
+        final_grads[5] = synced_grad_mlp_down 
 
         print("   - DEBUG: Manually synchronized gradients for 'mlp_down.kernel'.")
         return final_grads
@@ -780,17 +694,13 @@ class TensorParallelKeras(keras.Model):
             return gradients
         
         try:
-            # Initialize communicator
             from .communications_keras import TensorParallelCommunicator
             communicator = TensorParallelCommunicator(self.world_size, rank=0)
             
-            # Apply communication based on layer type and sharding strategy
             if "column" in layer_type.lower() or "up_projection" in layer_type.lower():
-                # Column-parallel layer: AllReduce gradients (conjugate of AllGather)
                 logger.info("   - Backward column-parallel: AllReducing gradients")
                 return communicator.backward_column_parallel(gradients, op="sum")
             elif "row" in layer_type.lower() or "down_projection" in layer_type.lower():
-                # Row-parallel layer: AllGather gradients (conjugate of AllReduce)
                 logger.info("   - Backward row-parallel: AllGathering gradients")
                 gathered = communicator.backward_row_parallel(gradients, dim=-1)
                 # Convert back to list format for optimizer

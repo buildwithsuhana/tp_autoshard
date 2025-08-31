@@ -22,27 +22,19 @@ def list_devices() -> List[str]:
     Returns:
         List of device identifiers in priority order (TPU > GPU > CPU)
     """
-    # --- MODIFICATION START ---
-    # Check for JAX backend first to correctly handle simulated devices.
     if keras.backend.backend() == 'jax':
         try:
             import jax
-            # jax.devices() correctly reports all devices, including simulated ones.
             jax_devices = jax.devices()
             if jax_devices:
                 logger.info(f"JAX backend detected, found {len(jax_devices)} devices via jax.devices()")
-                # Format device names to be consistent (e.g., 'cpu:0', 'gpu:1')
                 formatted_devices = [f"{d.platform.lower()}:{d.id}" for d in jax_devices]
                 return formatted_devices
         except (ImportError, Exception) as e:
             logger.warning(f"Could not use jax.devices() to detect devices: {e}")
-            # Fall through to the standard method if JAX check fails.
-    # --- MODIFICATION END ---
     
-    # Original fallback logic for non-JAX backends or if JAX check fails.
     devices = []
     
-    # Check for TPU devices
     try:
         tpu_devices = keras.config.list_physical_devices('TPU')
         if tpu_devices:
@@ -51,7 +43,6 @@ def list_devices() -> List[str]:
     except Exception as e:
         logger.debug(f"TPU detection failed: {e}")
     
-    # Check for GPU devices
     try:
         gpu_devices = keras.config.list_physical_devices('GPU')
         if gpu_devices:
@@ -60,7 +51,6 @@ def list_devices() -> List[str]:
     except Exception as e:
         logger.debug(f"GPU detection failed: {e}")
     
-    # Check for CPU devices
     try:
         cpu_devices = keras.config.list_physical_devices('CPU')
         if cpu_devices:
@@ -69,7 +59,6 @@ def list_devices() -> List[str]:
     except Exception as e:
         logger.debug(f"CPU detection failed: {e}")
     
-    # If no devices found, add default CPU
     if not devices:
         logger.warning("No physical devices detected, using default CPU")
         devices.append("cpu:0")
@@ -201,25 +190,20 @@ def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) 
         Configuration dictionary with devices, backend, and other settings
     """
     try:
-        # Get all available devices using our updated function
         all_devices = list_devices()
         
         if not all_devices:
             raise RuntimeError("No devices available for tensor parallelism")
         
-        # Determine world_size if not specified
         if world_size is None:
             world_size = len(all_devices)
         else:
             world_size = min(world_size, len(all_devices))
         
-        # Select the best devices
         selected_devices = all_devices[:world_size]
         
-        # Use specified backend or default to 'auto'
         recommended_backend = backend if backend else 'auto'
         
-        # Create configuration
         config = {
             'devices': selected_devices,
             'world_size': world_size,
@@ -231,7 +215,6 @@ def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) 
         
     except Exception as e:
         logger.error(f"Auto-configuration failed: {e}")
-        # Return fallback configuration
         return {
             'devices': ['cpu:0'],
             'world_size': 1,

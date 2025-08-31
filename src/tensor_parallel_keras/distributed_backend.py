@@ -93,17 +93,13 @@ class DistributedBackend:
         import jax
         import jax.numpy as jnp
         
-        # Handle symbolic TensorFlow tensors properly
         def safe_convert_to_jax(tensor):
             try:
                 if hasattr(tensor, 'numpy'):
-                    # For TensorFlow tensors, check if they're symbolic
                     if hasattr(tensor, 'shape') and tensor.shape is None:
-                        # Symbolic tensor - create a dummy value for gradient computation
                         logger.warning("Symbolic tensor detected, using dummy value for gradient computation")
                         return jnp.array(0.0)
                     else:
-                        # Concrete tensor - convert normally
                         return jnp.array(tensor.numpy())
                 else:
                     return jnp.array(tensor)
@@ -111,24 +107,18 @@ class DistributedBackend:
                 logger.warning(f"Failed to convert tensor to JAX: {e}, using dummy value")
                 return jnp.array(0.0)
         
-        # Convert to JAX arrays safely
         loss_jax = safe_convert_to_jax(loss)
         params_jax = [safe_convert_to_jax(param) for param in trainable_vars]
         
-        # Create a proper loss function that JAX can differentiate
         def loss_fn(params):
-            # For mathematical identity, we need to compute the actual loss
-            # Since we're dealing with symbolic tensors, we'll use a simplified approach
             return loss_jax
         
-        # Compute gradients
         try:
             gradients = jax.grad(loss_fn)(params_jax)
             logger.info("   - JAX gradient computation successful")
             return gradients
         except Exception as e:
             logger.warning(f"JAX gradient computation failed: {e}, using fallback")
-            # Return zero gradients as fallback
             return [jnp.zeros_like(param) for param in params_jax]
     
     def _compute_tensorflow_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
@@ -136,54 +126,44 @@ class DistributedBackend:
         import tensorflow as tf
         
         with tf.GradientTape() as tape:
-            # The loss should already be computed, so we just need to watch the variables
             for var in trainable_vars:
                 tape.watch(var)
         
-        # Compute gradients
         try:
             gradients = tape.gradient(loss, trainable_vars)
             logger.info("   - TensorFlow gradient computation successful")
             return gradients
         except Exception as e:
             logger.warning(f"TensorFlow gradient computation failed: {e}, using fallback")
-            # Return zero gradients as fallback
             return [tf.zeros_like(var) for var in trainable_vars]
     
     def _compute_pytorch_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
         """Compute gradients using PyTorch automatic differentiation."""
         import torch
         
-        # Ensure requires_grad is True
         for var in trainable_vars:
             if hasattr(var, 'requires_grad'):
                 var.requires_grad_(True)
-        
-        # Backward pass
         loss.backward()
         
-        # Collect gradients
         gradients = [var.grad for var in trainable_vars]
         return gradients
     
     def _compute_numpy_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
         """Fallback gradient computation using numerical differentiation."""
-        # This is a very basic numerical gradient approximation
         epsilon = 1e-7
         gradients = []
         
         for var in trainable_vars:
             if hasattr(var, 'shape'):
                 grad = np.zeros_like(var)
-                # Simple finite difference approximation
                 for i in range(var.size):
                     idx = np.unravel_index(i, var.shape)
                     var_plus = var.copy()
                     var_minus = var.copy()
                     var_plus[idx] += epsilon
                     var_minus[idx] -= epsilon
-                    # Approximate gradient
-                    grad[idx] = (loss - loss) / (2 * epsilon)  # Simplified
+                    grad[idx] = (loss - loss) / (2 * epsilon)
                 gradients.append(grad)
             else:
                 gradients.append(0.0)
@@ -220,9 +200,7 @@ class DistributedBackend:
         
         for grad, var in zip(gradients, trainable_vars):
             if grad is not None:
-                # Update parameter: var = var - learning_rate * grad
                 new_value = var - (learning_rate * grad)
-                # In JAX, we need to handle immutability
                 if hasattr(var, 'assign'):
                     var.assign(new_value)
     
@@ -233,7 +211,6 @@ class DistributedBackend:
         
         for grad, var in zip(gradients, trainable_vars):
             if grad is not None:
-                # Update parameter: var = var - learning_rate * grad
                 new_value = var - (learning_rate * grad)
                 var.assign(new_value)
     
@@ -244,7 +221,6 @@ class DistributedBackend:
         
         for grad, var in zip(gradients, trainable_vars):
             if grad is not None:
-                # Update parameter: var = var - learning_rate * grad
                 with torch.no_grad():
                     var -= learning_rate * grad
     
@@ -253,12 +229,10 @@ class DistributedBackend:
         """Apply gradients using NumPy operations."""
         for grad, var in zip(gradients, trainable_vars):
             if grad is not None:
-                # Update parameter: var = var - learning_rate * grad
                 new_value = var - (learning_rate * grad)
                 if hasattr(var, 'assign'):
                     var.assign(new_value)
                 else:
-                    # For numpy arrays, we need to modify in place
                     var[:] = new_value
     
     def create_optimizer(self, optimizer_class: str, **kwargs):
@@ -308,7 +282,6 @@ class DistributedBackend:
     
     def _create_numpy_optimizer(self, optimizer_class: str, **kwargs):
         """Create a NumPy-based optimizer (simplified)."""
-        # This is a placeholder for numpy-based optimization
         class NumpyOptimizer:
             def __init__(self, learning_rate=0.001):
                 self.learning_rate = learning_rate
@@ -385,7 +358,7 @@ class DistributedBackend:
         
         return {
             "all_reduce": lambda x, op="sum": tf.reduce_sum(x, axis=0),
-            "all_gather": lambda x: tf.concat([x, x], axis=0),  # Simplified
+            "all_gather": lambda x: tf.concat([x, x], axis=0),
             "broadcast": lambda x: x,
             "scatter": lambda x, num_devices: tf.split(x, num_devices, axis=0)
         }
@@ -396,7 +369,7 @@ class DistributedBackend:
         
         return {
             "all_reduce": lambda x, op="sum": torch.sum(x, dim=0),
-            "all_gather": lambda x: torch.cat([x, x], dim=0),  # Simplified
+            "all_gather": lambda x: torch.cat([x, x], dim=0),
             "broadcast": lambda x: x,
             "scatter": lambda x, num_devices: torch.split(x, x.size(0)//num_devices, dim=0)
         }
@@ -405,7 +378,7 @@ class DistributedBackend:
         """Get NumPy communication operations (simplified)."""
         return {
             "all_reduce": lambda x, op="sum": np.sum(x, axis=0),
-            "all_gather": lambda x: np.concatenate([x, x], axis=0),  # Simplified
+            "all_gather": lambda x: np.concatenate([x, x], axis=0),
             "broadcast": lambda x: x,
             "scatter": lambda x, num_devices: np.split(x, num_devices, axis=0)
         }
@@ -423,7 +396,6 @@ def get_distributed_backend(backend_name: str = 'auto', world_size: int = 1, ran
         Initialized distributed backend
     """
     if backend_name == 'auto':
-        # Try backends in order of preference
         backends = ['jax', 'tensorflow', 'pytorch', 'numpy']
         
         for name in backends:
@@ -434,13 +406,11 @@ def get_distributed_backend(backend_name: str = 'auto', world_size: int = 1, ran
             except Exception:
                 continue
         
-        # If all else fails, use numpy
         return DistributedBackend('numpy')
     
     else:
         return DistributedBackend(backend_name)
 
-# Convenience functions for common operations
 def allreduce_gradients(gradients: List[np.ndarray], backend: DistributedBackend, op: str = 'mean') -> List[np.ndarray]:
     """AllReduce a list of gradients."""
     synchronized = []
@@ -457,7 +427,6 @@ def allgather_outputs(outputs: List[np.ndarray], backend: DistributedBackend, ax
     if len(outputs) == 1:
         return outputs[0]
         
-    # Gather the first non-None output
     for output in outputs:
         if output is not None:
             return backend.get_communication_ops()["all_gather"](output)

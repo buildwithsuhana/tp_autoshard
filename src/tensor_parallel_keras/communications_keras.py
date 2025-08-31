@@ -11,12 +11,10 @@ import keras
 
 logger = logging.getLogger(__name__)
 
-# Use centralized backend for tensor operations
 from .distributed_backend import DistributedBackend
 
 def _get_tensor_lib(tensor):
     """Determine which tensor library a tensor belongs to using centralized backend."""
-    # Try to detect backend from tensor
     if hasattr(tensor, 'detach'):
         return 'pytorch'
     elif hasattr(tensor, 'numpy'):
@@ -26,13 +24,13 @@ def _get_tensor_lib(tensor):
     else:
         return 'numpy'
 
+
 def _clone_tensor(tensor):
     """Clone a tensor using centralized backend operations."""
     tensor_lib = _get_tensor_lib(tensor)
     backend = DistributedBackend(tensor_lib)
     return backend.convert_to_backend_tensor(tensor)
 
-# In communications_keras.py
 
 def _cat_tensors(tensors, dim=-1):
     """
@@ -45,35 +43,20 @@ def _cat_tensors(tensors, dim=-1):
         return tensors[0]
 
     try:
-        # --- FIX: Convert all tensors to NumPy arrays for backend safety ---
-        numpy_tensors = []
-        for t in tensors:
-            # The .numpy() method is a common way to convert various tensor types
-            if hasattr(t, 'numpy'):
-                numpy_tensors.append(np.array(t))
-            # Fallback for objects that are already NumPy or need np.array()
-            else:
-                numpy_tensors.append(np.array(t))
-        
-        # Now, concatenate the uniform list of NumPy arrays
-        # The 'axis' parameter in keras.ops.concatenate is equivalent to 'dim'
+        numpy_tensors = [np.array(t) for t in tensors]
         return keras.ops.concatenate(numpy_tensors, axis=dim)
         
     except Exception as e:
-        # Log the specific error to help with debugging backend issues
         logger.error(f"Error during tensor conversion or concatenation in _cat_tensors: {e}")
-        # Fallback to returning the first tensor if concatenation fails
         return tensors[0]
+
 
 def _sum_tensors(tensors):
     """Sums a list of tensors element-wise."""
     if not tensors:
         return None
-    
-    # Start with the first tensor
+
     total = tensors[0]
-    
-    # Add the rest of the tensors in the list
     for tensor in tensors[1:]:
         total = keras.ops.add(total, tensor)
         
@@ -82,7 +65,6 @@ def _sum_tensors(tensors):
 
 class CollectiveOpKeras:
     """Base class for collective operations."""
-    
     def __init__(self, world_size: int, rank: int = 0):
         self.world_size = world_size
         self.rank = rank
@@ -111,21 +93,15 @@ class AllReduceKeras(CollectiveOpKeras):
         if len(tensors) != self.world_size:
             raise ValueError(f"Expected {self.world_size} tensors, got {len(tensors)}")
         
-        # Implement proper AllReduce for true tensor parallelism
         if self.op == "sum":
-            # Sum all tensors across devices
             total = _sum_tensors(tensors)
-            # Return same result for all shards (replicated)
             return [_clone_tensor(total) for _ in range(self.world_size)]
         
         elif self.op == "mean":
-            # Average across devices
             total = _sum_tensors(tensors)
-            # For mean, we need to divide by world_size
             if hasattr(total, '__truediv__'):
                 result = total / self.world_size
             else:
-                # Fallback for numpy arrays
                 result = total / self.world_size
             return [_clone_tensor(result) for _ in range(self.world_size)]
         
@@ -153,23 +129,14 @@ class AllGatherKeras(CollectiveOpKeras):
         if len(tensors) != self.world_size:
             raise ValueError(f"Expected {self.world_size} tensors, got {len(tensors)}")
         
-        # Concatenate tensors along the specified dimension
-        # For Dense layers with column-wise sharding, this would be dim=1
-        # For row-wise sharding, this would be dim=0
-        
         try:
-            # Handle different tensor shapes
             if all(t.shape == tensors[0].shape for t in tensors):
-                # Same shape tensors - concatenate along specified dim
                 return _cat_tensors(tensors, dim=self.dim)
             else:
-                # Different shapes - need to handle carefully
-                # This might happen with mixed sharding strategies
                 logger.warning("Tensors have different shapes, concatenating along last dimension")
                 return _cat_tensors(tensors, dim=-1)
         except Exception as e:
             logger.error(f"Error in AllGather: {e}")
-            # Fallback: return first tensor
             return tensors[0]
 
 
@@ -190,8 +157,6 @@ class BroadcastKeras(CollectiveOpKeras):
         Returns:
             List of broadcasted tensors for each shard
         """
-        # For now, just clone the tensor for each shard
-        # In production, you'd implement proper broadcast
         return [_clone_tensor(tensor) for _ in range(self.world_size)]
 
 
@@ -212,14 +177,10 @@ class ScatterKeras(CollectiveOpKeras):
         Returns:
             List of scattered tensors for each shard
         """
-        # Split tensor along specified dimension
         try:
-            # This is a simplified scatter - in practice, you'd implement proper splitting
-            # For now, just clone the tensor for each shard
             return [_clone_tensor(tensor) for _ in range(self.world_size)]
         except Exception as e:
             logger.error(f"Error in Scatter: {e}")
-            # Fallback: return same tensor for all shards
             return [_clone_tensor(tensor) for _ in range(self.world_size)]
 
 
@@ -237,7 +198,6 @@ class TensorParallelCommunicator:
         self.world_size = world_size
         self.rank = rank
         
-        # Initialize communication primitives
         self.allreduce = AllReduceKeras(world_size, rank=rank)
         self.allgather = AllGatherKeras(world_size, rank=rank)
         self.broadcast = BroadcastKeras(world_size, rank=rank)
@@ -310,10 +270,7 @@ class TensorParallelCommunicator:
         
         This eliminates one AllReduce in the forward pass.
         """
-        # Up projection: AllGather the outputs
         up_output = self.forward_column_parallel(up_projection_outputs, dim=-1)
-        
-        # Down projection: AllReduce the inputs (handshake)
         down_inputs = self.forward_row_parallel(down_projection_inputs, op="sum")
         
         return up_output, down_inputs
@@ -335,17 +292,13 @@ class TensorParallelCommunicator:
             Sliced gradient corresponding to this device's shard
         """
         try:
-            # Determine the slice size for each shard
             total_size = full_gradient.shape[dim]
             slice_size = total_size // world_size
             
-            # Calculate start and end indices for this rank
             start_idx = rank * slice_size
             end_idx = start_idx + slice_size if rank < world_size - 1 else total_size
             
-            # Slice the gradient along the specified dimension
             if dim == -1:
-                # Last dimension (features)
                 if hasattr(full_gradient, 'shape') and len(full_gradient.shape) >= 2:
                     if _get_tensor_lib(full_gradient) == 'pytorch':
                         return full_gradient[..., start_idx:end_idx]
@@ -354,12 +307,10 @@ class TensorParallelCommunicator:
                         return tf.slice(full_gradient, [0] * (len(full_gradient.shape) - 1) + [start_idx], 
                                      [-1] * (len(full_gradient.shape) - 1) + [end_idx - start_idx])
                     else:
-                        # NumPy fallback
                         slices = [slice(None)] * len(full_gradient.shape)
                         slices[dim] = slice(start_idx, end_idx)
                         return full_gradient[tuple(slices)]
             
-            # For other dimensions, use generic slicing
             slices = [slice(None)] * len(full_gradient.shape)
             slices[dim] = slice(start_idx, end_idx)
             return full_gradient[tuple(slices)]
@@ -385,15 +336,12 @@ class TensorParallelCommunicator:
             Sliced gradient corresponding to this device's shard
         """
         try:
-            # For row-parallel, we typically slice along batch dimension
             total_size = full_gradient.shape[dim]
             slice_size = total_size // world_size
             
-            # Calculate start and end indices for this rank
             start_idx = rank * slice_size
             end_idx = start_idx + slice_size if rank < world_size - 1 else total_size
             
-            # Slice the gradient along the specified dimension
             slices = [slice(None)] * len(full_gradient.shape)
             slices[dim] = slice(start_idx, end_idx)
             return full_gradient[tuple(slices)]

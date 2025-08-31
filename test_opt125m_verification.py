@@ -8,6 +8,7 @@ import logging
 import numpy as np
 import keras
 from keras import layers, optimizers
+import matplotlib.pyplot as plt # MODIFIED: Added matplotlib import
 
 # Import TensorParallelKeras
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
@@ -16,7 +17,9 @@ from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
+# Configure environment for CPU device splitting
+# os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+
 def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers=2, num_heads=4):
     """Create a simplified OPT-125M model for faster testing."""
     print("   Creating simplified OPT-125M model...")
@@ -34,7 +37,6 @@ def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers
     print(f"      Simplified model created with {model.count_params():,} parameters")
     return model
 
-# This function is now restored to its original 12-layer version.
 def create_opt125m_model(vocab_size=50257, hidden_size=768, num_layers=12, num_heads=12):
     """Create a simplified OPT-125M model for testing."""
     print("   Creating OPT-125M model...")
@@ -65,8 +67,6 @@ def create_opt125m_model(vocab_size=50257, hidden_size=768, num_layers=12, num_h
     outputs = layers.Dense(vocab_size, name='lm_head')(hidden_states)
     model = keras.Model(inputs=inputs, outputs=outputs, name='OPT-125M')
     return model
-
-# ... the rest of the test functions remain the same ...
 
 def verify_layer_sharding(tp_model):
     """Verify that layers are properly sharded in the tensor parallel model."""
@@ -130,6 +130,44 @@ def test_opt125m_inference_correctness():
     print(f"✅ OPT-125M inference correctness test completed in {time.time() - start_time:.2f}s")
     return True
 
+# MODIFIED: Added a new function to plot the graphs.
+def plot_training_graphs(original_history, tp_history):
+    """
+    Plots the loss and perplexity curves for both the original and TP models.
+    """
+    if original_history and tp_history:
+        # Calculate perplexity from loss. Perplexity = exp(loss)
+        original_perplexity = np.exp(original_history.history['loss'])
+        tp_perplexity = np.exp(tp_history.history['loss'])
+
+        epochs = range(1, len(original_history.history['loss']) + 1)
+        
+        # Plot Loss
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs, original_history.history['loss'], 'b-o', label='Original Model Loss')
+        plt.plot(epochs, tp_history.history['loss'], 'r-x', label='TP Model Loss')
+        plt.title('Training Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        
+        # Plot Perplexity
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs, original_perplexity, 'b-o', label='Original Model Perplexity')
+        plt.plot(epochs, tp_perplexity, 'r-x', label='TP Model Perplexity')
+        plt.title('Training Perplexity')
+        plt.xlabel('Epochs')
+        plt.ylabel('Perplexity')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+        print("\n   Generating training performance graphs...")
+
+
 def test_opt125m_training_verification():
     """Test OPT-125M training verification."""
     print("🔧 OPT-125M Training Verification")
@@ -138,47 +176,66 @@ def test_opt125m_training_verification():
     print(f"⏱️  {time.time() - start_time:.2f}s: Starting OPT-125M training test...")
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating simplified OPT-125M model...")
     opt_model = create_simplified_opt125m_model()
-    print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel wrapper...")
     tp_model = TensorParallelKeras(model=opt_model, world_size=2, distributed_backend='fallback')
     print(f"✅ {time.time() - start_time:.2f}s: Models created successfully")
+    
+    # --- START OF THE FIX ---
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating and pre-building the optimizer...")
+    # 1. Create the base Adam optimizer instance that will be shared.
+    base_optimizer = optimizers.Adam()
+    # 2. Manually "build" the optimizer with the original model's variables.
+    #    This is the crucial step that creates the optimizer's state variables (m, v, etc.).
+    base_optimizer.build(opt_model.trainable_variables)
+    print(f"      ✅ Optimizer is now built and has state variables.")
+    # --- END OF THE FIX ---
+
     print(f"⏱️  {time.time() - start_time:.2f}s: Testing compilation...")
     try:
-        tp_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        # 3. Pass the PRE-BUILT optimizer to the compile method.
+        #    The CoordinatedOptimizer will now find the states it needs to shard.
+        tp_model.compile(optimizer=base_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         print(f"✅ {time.time() - start_time:.2f}s: Models compiled successfully")
     except Exception as e:
         print(f"      ⚠️  Compilation failed: {e}")
+        
     print(f"⏱️  {time.time() - start_time:.2f}s: Testing training...")
     x_train = np.random.randint(0, 1000, (100, 10), dtype=np.int32)
-    vocab_size = 1000
-    target_indices = np.random.randint(0, vocab_size, (100, 10), dtype=np.int32)
-    y_train = np.zeros((100, 10, vocab_size), dtype=np.float32)
-    for i in range(100):
-        for j in range(10):
-            y_train[i, j, target_indices[i, j]] = 1.0
+    y_train = np.random.randint(0, 1000, (100, 10), dtype=np.int32)
+    
     print("\n   Training models for comparison...")
     original_history = None
     try:
-        opt_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-        original_history = opt_model.fit(x_train, target_indices, epochs=2, batch_size=16, verbose=0)
+        # We need a separate optimizer for the original model to keep the states independent
+        original_optimizer = optimizers.Adam()
+        opt_model.compile(optimizer=original_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        original_history = opt_model.fit(x_train, y_train, epochs=2, batch_size=16, verbose=0)
         print(f"      ✅ Original model training completed")
     except Exception as e:
         print(f"      ⚠️  Original model training failed: {e}")
+        
     tp_history = None
     try:
-        tp_history = tp_model.fit(x_train, target_indices, epochs=2, batch_size=16, verbose=0)
+        tp_history = tp_model.fit(x_train, y_train, epochs=2, batch_size=16, verbose=0)
         print(f"      ✅ TP model training completed")
     except Exception as e:
         print(f"      ⚠️  TP model training failed: {repr(e)}")
+        
     if original_history and tp_history:
         print(f"\n   Comparing training curves...")
         original_final_loss = original_history.history['loss'][-1]
         tp_final_loss = tp_history.history['loss'][-1]
         loss_diff = abs(original_final_loss - tp_final_loss)
         print(f"      Final loss difference: {loss_diff:.6f}")
-        if loss_diff < 1.0:
+        if loss_diff < 1.0: # A lenient threshold for verification
             print(f"      ✅ Learning verification passed")
         else:
             print(f"      ❌ Learning verification failed")
+    
+    # MODIFIED: Call the new function to generate the graphs
+    plot_training_graphs(original_history, tp_history)
+            
     print(f"✅ OPT-125M training verification completed in {time.time() - start_time:.2f}s")
     return True
 

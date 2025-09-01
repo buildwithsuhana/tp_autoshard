@@ -22,6 +22,16 @@ def list_devices() -> List[str]:
     Returns:
         List of device identifiers in priority order (TPU > GPU > CPU)
     """
+    if keras.backend.backend() == 'torch':
+        try:
+            import torch
+            if torch.cuda.is_available():
+                count = torch.cuda.device_count()
+                logger.info(f"PyTorch backend detected, found {count} CUDA devices.")
+                return [f"cuda:{i}" for i in range(count)]
+        except (ImportError, Exception) as e:
+            logger.warning(f"Could not use torch to detect devices: {e}")
+
     if keras.backend.backend() == 'jax':
         try:
             import jax
@@ -34,30 +44,15 @@ def list_devices() -> List[str]:
             logger.warning(f"Could not use jax.devices() to detect devices: {e}")
     
     devices = []
-    
-    try:
-        tpu_devices = keras.config.list_physical_devices('TPU')
-        if tpu_devices:
-            logger.info(f"Found {len(tpu_devices)} TPU devices")
-            devices.extend([f"tpu:{i}" for i in range(len(tpu_devices))])
-    except Exception as e:
-        logger.debug(f"TPU detection failed: {e}")
-    
-    try:
-        gpu_devices = keras.config.list_physical_devices('GPU')
-        if gpu_devices:
-            logger.info(f"Found {len(gpu_devices)} GPU devices")
-            devices.extend([f"gpu:{i}" for i in range(len(gpu_devices))])
-    except Exception as e:
-        logger.debug(f"GPU detection failed: {e}")
-    
-    try:
-        cpu_devices = keras.config.list_physical_devices('CPU')
-        if cpu_devices:
-            logger.info(f"Found {len(cpu_devices)} CPU devices")
-            devices.extend([f"cpu:{i}" for i in range(len(cpu_devices))])
-    except Exception as e:
-        logger.debug(f"CPU detection failed: {e}")
+
+    for device_type in ["TPU", "GPU", "CPU"]:
+        try:
+            physical_devices = keras.config.list_physical_devices(device_type)
+            if physical_devices:
+                logger.info(f"Found {len(physical_devices)} {device_type} devices")
+                devices.extend([f"{device_type.lower()}:{i}" for i in range(len(physical_devices))])
+        except Exception as e:
+            logger.debug(f"{device_type} detection failed: {e}")
     
     if not devices:
         logger.warning("No physical devices detected, using default CPU")

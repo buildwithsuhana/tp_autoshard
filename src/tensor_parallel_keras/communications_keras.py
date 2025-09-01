@@ -27,8 +27,11 @@ def _get_tensor_lib(tensor):
 
 def _clone_tensor(tensor):
     """Clone a tensor using centralized backend operations."""
-    tensor_lib = _get_tensor_lib(tensor)
-    backend = DistributedBackend(tensor_lib)
+    current_backend_name = keras.backend.backend()
+    # Create the backend instance for the correct, active backend.
+    backend = DistributedBackend(current_backend_name)
+    # --- END OF CHANGE ---
+
     return backend.convert_to_backend_tensor(tensor)
 
 
@@ -43,7 +46,9 @@ def _cat_tensors(tensors, dim=-1):
         return tensors[0]
 
     try:
-        numpy_tensors = [np.array(t) for t in tensors]
+        numpy_tensors = [keras.ops.convert_to_numpy(t) for t in tensors]
+        # --- END OF CHANGE ---
+
         return keras.ops.concatenate(numpy_tensors, axis=dim)
         
     except Exception as e:

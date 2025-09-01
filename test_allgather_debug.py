@@ -12,22 +12,19 @@ def test_allgather_debug():
     print("🧪 Debugging AllGather Operation")
     print("=" * 40)
     
-    # Create simple test tensors
     tensor1 = keras.ops.array([[1.0, 2.0], [3.0, 4.0]], dtype="float32")
     tensor2 = keras.ops.array([[5.0, 6.0], [7.0, 8.0]], dtype="float32")
     
-    print(f"Tensor 1 shape: {np.array(tensor1)}values:\n{np.array(tensor1)}")
-    print(f"Tensor 2 shape: {np.array(tensor2)}, values:\n{np.array(tensor2)}")
+    print(f"Tensor 1 shape: {tensor1.shape}, values:\n{keras.ops.convert_to_numpy(tensor1)}")
+    print(f"Tensor 2 shape: {tensor2.shape}, values:\n{keras.ops.convert_to_numpy(tensor2)}")
     
-    # Test AllGather along last dimension (dim=-1)
     allgather = AllGatherKeras(world_size=2, dim=-1)
     
     try:
         result = allgather([tensor1, tensor2])
         print(f"AllGather result shape: {result.shape}")
-        print(f"AllGather result values:\n{np.array(result)}")
+        print(f"AllGather result values:\n{keras.ops.convert_to_numpy(result)}")
         
-        # Expected result should be (2, 4) - concatenating along features
         expected_shape = (2, 4)
         if result.shape == expected_shape:
             print("✅ AllGather shape is correct!")
@@ -40,4 +37,4 @@ def test_allgather_debug():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    test_allgather_debug() 
+    test_allgather_debug()

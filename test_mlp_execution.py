@@ -36,65 +36,71 @@ def create_mlp_model():
 
 def test_mlp_execution():
     """Test MLP tensor parallelism execution."""
-    print("Testing MLP (Multi-Layer Perceptron) tensor parallelism execution...")
+    print("\n🧪 Testing MLP (Multi-Layer Perceptron) tensor parallelism execution...")
     
     # Create model
     model = create_mlp_model()
-    print(f"Model created with {len(model.layers)} layers")
+    print(f"   - Model created with {len(model.layers)} layers")
     
-    # Create tensor parallel model with JAX backend
+    # Create tensor parallel model
     tp_manager = TensorParallelKeras(
         model=model,
         device_ids=['cpu:0', 'cpu:1']
     )
     print("   - Tensor parallel manager created")
 
-    # 2. Build the final, ASSEMBLED model from the manager
+    # Build the final, ASSEMBLED model from the manager
     model_tp_assembled = tp_manager.build_assembled_model()
-    print("Tensor parallel model created")
+    print("   - Assembled tensor parallel model built")
     
     # Create test input
     input_data = np.random.random((16, 128)).astype(np.float32)
-    print(f"Input data shape: {input_data.shape}")
+    print(f"   - Input data shape: {input_data.shape}")
     
     # Run single device model
     single_output = model(input_data)
-    print(f"Single device output shape: {single_output.shape}")
+    print(f"\n▶️ Running models...")
+    print(f"   - Single device output shape: {single_output.shape}")
     
     # Run tensor parallel model
     tp_output = model_tp_assembled(input_data)
-    print(f"Tensor parallel output shape: {tp_output.shape}")
+    print(f"   - Tensor parallel output shape: {tp_output.shape}")
     
     # Check shapes match
     shape_match = single_output.shape == tp_output.shape
-    print(f"Shape match: {shape_match}")
+    print(f"\n🔍 Comparing outputs...")
+    print(f"   - Shape match: {shape_match}")
     
     if shape_match:
-        # Convert to numpy for comparison
-        single_np = np.array(single_output)
-        tp_np = np.array(tp_output)
+        # --- MODIFICATION START ---
+        # Use the safe, backend-agnostic Keras function to convert tensors
+        # from any device (CPU, GPU, MPS) to NumPy arrays.
+        print("   - Converting outputs to NumPy for comparison...")
+        single_np = keras.ops.convert_to_numpy(single_output)
+        tp_np = keras.ops.convert_to_numpy(tp_output)
+        # --- MODIFICATION END ---
         
         # Calculate differences
         abs_diff = np.abs(single_np - tp_np)
         rel_diff = abs_diff / (np.abs(single_np) + 1e-8)
         
-        print(f"Max absolute difference: {np.max(abs_diff):.2e}")
-        print(f"Max relative difference: {np.max(rel_diff):.2e}")
+        print(f"   - Max absolute difference: {np.max(abs_diff):.2e}")
+        print(f"   - Max relative difference: {np.max(rel_diff):.2e}")
         
         # Check if within tolerance
         tolerance = 1e-5
         within_tolerance = np.max(abs_diff) < tolerance
         
         if within_tolerance:
-            print("✅ MATHEMATICAL IDENTITY ACHIEVED! (within tolerance)")
+            print("\n✅ MATHEMATICAL IDENTITY ACHIEVED! (within tolerance)")
         else:
-            print("❌ Mathematical differences detected")
+            print("\n❌ Mathematical differences detected")
             
         # Show sample values
-        print("\nSample values:")
-        print(f"  Single device: {single_np[0, :5]}")
-        print(f"  Tensor parallel: {tp_np[0, :5]}")
-        print(f"  Differences: {abs_diff[0, :5]}")
+        print("\n   Sample values (first 5 elements of first batch item):")
+        print(f"     Single device:   {single_np[0, :5]}")
+        print(f"     Tensor parallel: {tp_np[0, :5]}")
+        print(f"     Differences:     {abs_diff[0, :5]}")
         
         # Show layer-by-layer sharding info
         print("\n🔧 Layer Sharding Information:")
@@ -104,7 +110,7 @@ def test_mlp_execution():
                     if hasattr(weight, 'shape'):
                         print(f"  Layer {i} ({layer.name}) - Weight {j}: {weight.shape}")
     else:
-        print("❌ Shape mismatch - execution failed")
+        print("\n❌ Shape mismatch - execution failed")
 
 if __name__ == "__main__":
-    test_mlp_execution() 
+    test_mlp_execution()

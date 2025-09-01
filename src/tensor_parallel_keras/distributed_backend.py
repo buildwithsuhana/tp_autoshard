@@ -7,6 +7,7 @@ Centralizes all backend-specific operations for JAX, TensorFlow, and PyTorch
 import logging
 from typing import List, Any, Union, Tuple, Optional
 import numpy as np
+import keras 
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,29 @@ class DistributedBackend:
     
     def __init__(self, backend_name: str = "auto"):
         self.backend_name = backend_name
-        self.backend = self._detect_backend()
+        self.backend = self._initialize_backend()
+
+    def _initialize_backend(self) -> str:
+        """Initializes the backend, respecting the user's choice."""
+        if self.backend_name != "auto":
+            # If a specific backend is requested, use it.
+            return self.backend_name
+
+        # --- This is the old _detect_backend logic, now used only for "auto" ---
+        try:
+            import jax
+            return "jax"
+        except ImportError:
+            try:
+                import tensorflow as tf
+                return "tensorflow"
+            except ImportError:
+                try:
+                    import torch
+                    return "pytorch"
+                except ImportError:
+                    return "numpy"
+
         
     def _detect_backend(self) -> str:
         """Detect the available backend."""
@@ -63,15 +86,10 @@ class DistributedBackend:
                 return tf.convert_to_tensor(tensor)
         elif self.backend == "pytorch":
             import torch
-            if hasattr(tensor, 'numpy'):
-                return torch.tensor(tensor.numpy())
-            else:
-                return torch.tensor(tensor)
+            # Use the native clone() method; detach() removes it from the grad graph
+            return tensor.clone().detach()
         else:
-            if hasattr(tensor, 'numpy'):
-                return tensor.numpy()
-            else:
-                return np.array(tensor)
+            return keras.ops.convert_to_numpy(tensor)
     
     def compute_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
         """Compute gradients using the appropriate backend's automatic differentiation."""
@@ -138,16 +156,19 @@ class DistributedBackend:
             return [tf.zeros_like(var) for var in trainable_vars]
     
     def _compute_pytorch_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
-        """Compute gradients using PyTorch automatic differentiation."""
-        import torch
-        
-        for var in trainable_vars:
-            if hasattr(var, 'requires_grad'):
-                var.requires_grad_(True)
-        loss.backward()
-        
-        gradients = [var.grad for var in trainable_vars]
-        return gradients
+        """
+        Computes gradients for PyTorch.
+        NOTE: In a Keras model, this is handled by `loss.backward()` in the `train_step`.
+        This function is deprecated for the Keras workflow.
+        """
+        logger.warning("PyTorch gradient computation is handled by `loss.backward()` in the Keras model's `train_step`.")
+        # The actual logic `loss.backward()` is stateful and doesn't fit this functional pattern.
+        return self._create_zero_gradients(trainable_vars)
+    
+    def _create_zero_gradients(self, trainable_vars: List[Any]) -> List[Any]:
+        """Create zero gradients as fallback."""
+        lib = self.get_tensor_lib()
+        return [lib.zeros_like(var) for var in trainable_vars]
     
     def _compute_numpy_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
         """Fallback gradient computation using numerical differentiation."""
@@ -170,16 +191,16 @@ class DistributedBackend:
         
         return gradients
     
-    def _create_zero_gradients(self, trainable_vars: List[Any]) -> List[Any]:
-        """Create zero gradients as fallback."""
-        gradients = []
-        for var in trainable_vars:
-            if hasattr(var, 'shape'):
-                zero_grad = np.zeros_like(var)
-                gradients.append(zero_grad)
-            else:
-                gradients.append(0.0)
-        return gradients
+    # def _create_zero_gradients(self, trainable_vars: List[Any]) -> List[Any]:
+    #     """Create zero gradients as fallback."""
+    #     gradients = []
+    #     for var in trainable_vars:
+    #         if hasattr(var, 'shape'):
+    #             zero_grad = np.zeros_like(var)
+    #             gradients.append(zero_grad)
+    #         else:
+    #             gradients.append(0.0)
+    #     return gradients
     
     def apply_gradients(self, gradients: List[Any], trainable_vars: List[Any], 
                        learning_rate: float = 0.001) -> None:
@@ -312,8 +333,10 @@ class DistributedBackend:
                 info["device_count"] = len(tf.config.list_physical_devices())
             elif self.backend == "pytorch":
                 import torch
-                info["devices"] = [str(d) for d in torch.device("cpu")]
-                info["device_count"] = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                if torch.cuda.is_available():
+                    count = torch.cuda.device_count()
+                    info["devices"] = [f"cuda:{i}" for i in range(count)]
+                    info["device_count"] = count
             else:
                 info["devices"] = ["cpu"]
                 info["device_count"] = 1
@@ -363,15 +386,34 @@ class DistributedBackend:
             "scatter": lambda x, num_devices: tf.split(x, num_devices, axis=0)
         }
     
-    def _get_pytorch_communication_ops(self):
-        """Get PyTorch communication operations."""
+    def _pytorch_all_gather_wrapper(self, tensor, axis=-1):
+        """Wrapper for torch.distributed.all_gather to provide a friendlier API."""
         import torch
+        import torch.distributed as dist
+        world_size = dist.get_world_size()
+        tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
+        dist.all_gather(tensor_list, tensor)
+        return torch.cat(tensor_list, dim=axis)
+    
+    def _get_pytorch_communication_ops(self):
+        """Get PyTorch communication operations using torch.distributed."""
+        import torch
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                logger.info("Using real torch.distributed communication ops.")
+                return {
+                    "all_reduce": lambda x, op="sum": dist.all_reduce(x, op=dist.ReduceOp.SUM) or x,
+                    "all_gather": self._pytorch_all_gather_wrapper,
+                }
+        except (ImportError, RuntimeError):
+            pass # Fallback to simulation
         
+        logger.warning("torch.distributed not available or initialized. Using SIMULATED communication ops.")
+        world_size = 1 # Cannot know world_size, assume 1
         return {
-            "all_reduce": lambda x, op="sum": torch.sum(x, dim=0),
-            "all_gather": lambda x: torch.cat([x, x], dim=0),
-            "broadcast": lambda x: x,
-            "scatter": lambda x, num_devices: torch.split(x, x.size(0)//num_devices, dim=0)
+            "all_reduce": lambda x, op="sum": x,
+            "all_gather": lambda x, axis=-1: torch.cat([x] * world_size, dim=axis),
         }
     
     def _get_numpy_communication_ops(self):

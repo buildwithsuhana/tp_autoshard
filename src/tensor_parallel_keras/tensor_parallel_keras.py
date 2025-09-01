@@ -15,40 +15,43 @@ from .parameter_sharding import make_parameter_sharded_model
 from .sharding_keras import ShardedKeras
 from .coordinated_optimizer import TensorParallelOptimizer
 from .parameter_sharding import ShardedWeight
-
+from .distribution_lib import get_best_devices
 logger = logging.getLogger(__file__)
 
-class TensorParallelKeras:
+class TensorParallelKeras(keras.Model):
+
     def __init__(self, model, world_size=None, device_ids=None, distributed_backend="auto", **kwargs):
+        super().__init__()
         print("=" * 50)
         print("TensorParallelKeras Manager __init__ called!")
         print("=" * 50)
-
-        if isinstance(model, keras.Sequential) and model.input_shape:
-            print("🔧 Converting Sequential model to Functional model for stability...")
-            inputs = keras.Input(batch_shape=model.input_shape, dtype=model.input_dtype)
-            outputs = model(inputs)
-            model = keras.Model(inputs, outputs, name=model.name)
+        
         
         self.original_model = model
-        self.world_size = world_size if world_size is not None else 1 
+        self.world_size = world_size if world_size is not None else 1
 
         if self.world_size <= 1:
             self.distributed = False
+            self.model_shards = [self.original_model]
             self.sharded_models = [self.original_model]
             return
 
         self.distributed = True
-        self.devices = [f"cpu:{i}" for i in range(self.world_size)] 
+        # self.devices = [f"cpu:{i}" for i in range(self.world_size)] 
+
+        self.devices = get_best_devices(self.world_size)
         self.tensor_parallel_config = get_default_config_keras(model, self.devices)
         config_with_ops = self.tensor_parallel_config.create_collective_ops(self.devices, self.distributed)
         
+        self.model_shards = []
         self.sharded_models = []
+        
         print(f"🔧 Creating model shards for {model.name}")
         for rank in range(self.world_size):
             shard_wrapper, _ = make_parameter_sharded_model(
                 model, config_with_ops, rank=rank, world_size=self.world_size
             )
+            self.model_shards.append(shard_wrapper)
             self.sharded_models.append(shard_wrapper.original_model)
 
     def build_assembled_model(self):
@@ -316,58 +319,54 @@ class TensorParallelKeras:
             self.devices,
             0  
         )
-        
+
+
     def call(self, inputs, training=None, **kwargs):
         """
-        Orchestrates the forward pass by running all shards in parallel and
-        combining their outputs correctly based on the sharding strategy.
+        Orchestrates the forward pass. This final version correctly handles replicated
+        outputs from complex models with internal sharding (like KerasNLP backbones).
         """
-
         if not self.distributed:
-            return self.sharded_models[0](inputs, training=training, **kwargs)
+            return self.original_model(inputs, training=training, **kwargs)
 
         partial_outputs = [model(inputs, training=training, **kwargs) for model in self.sharded_models]
 
         if not partial_outputs:
             logger.warning("No shard outputs found, returning None.")
             return None
-        
-        final_layer = self.original_model.layers[-1]
-        sharding_type = "unknown"
-        final_kernel_name = f"{final_layer.name}.kernel"
 
-        for pattern, action in self.tensor_parallel_config.state_rules.items():
-            if re.match(pattern, final_kernel_name):
-                if hasattr(action, 'sharding_type'):
-                    sharding_type = action.sharding_type
-                break
-        
-        if sharding_type == "column":
-            logger.info("   - Applying AllGather (concatenation) for column-parallel output.")
-            final_output = keras.ops.concatenate(partial_outputs, axis=-1)
-
-            original_output_dim = self.original_model.output_shape[-1]
-            if final_output.shape[-1] != original_output_dim:
-                final_output = final_output[..., :original_output_dim]
-            
-            return final_output
-
-        elif sharding_type == "row":
-            logger.info("   - Applying AllReduce (summation) for row-parallel output.")
-            final_output = keras.ops.sum(keras.ops.stack(partial_outputs), axis=0)
-
-            if final_layer.use_bias:
-                bias = final_layer.bias
-                bias_shape = [1] * (len(final_output.shape) - 1) + [-1]
-                reshaped_bias = keras.ops.reshape(bias, bias_shape)
-                final_output -= reshaped_bias * (self.world_size - 1)
-                logger.info(f"   - Corrected for replicated bias added {self.world_size} times.")
-                
-            return final_output
+        if isinstance(partial_outputs[0], dict):
+            return partial_outputs[0]
 
         else:
-            logger.warning(f"   - Final layer '{final_layer.name}' is not sharded. Returning output from first shard.")
-            return partial_outputs[0]
+            final_layer = self.original_model.layers[-1]
+            sharding_type = "unknown"
+            final_kernel_name = f"{final_layer.name}.kernel"
+            for pattern, action in self.tensor_parallel_config.state_rules.items():
+                if re.match(pattern, final_kernel_name):
+                    if hasattr(action, 'sharding_type'):
+                        sharding_type = action.sharding_type
+                    break
+            
+            if sharding_type == "column":
+                final_output = keras.ops.concatenate(partial_outputs, axis=-1)
+                if isinstance(self.original_model.output_shape, (list, tuple)):
+                     original_output_dim = self.original_model.output_shape[-1]
+                     if final_output.shape[-1] != original_output_dim:
+                         final_output = final_output[..., :original_output_dim]
+                return final_output
+
+            elif sharding_type == "row":
+                final_output = keras.ops.sum(keras.ops.stack(partial_outputs), axis=0)
+                if final_layer.use_bias:
+                    bias = final_layer.bias
+                    bias_shape = [1] * (len(final_output.shape) - 1) + [-1]
+                    reshaped_bias = keras.ops.reshape(bias, bias_shape)
+                    final_output -= reshaped_bias * (self.world_size - 1)
+                return final_output
+
+            else:
+                return partial_outputs[0]
 
 
     def _apply_forward_communication(self, inputs, training=None, **kwargs):
@@ -539,11 +538,26 @@ class TensorParallelKeras:
         """
 
         if not self.distributed:
-            with tf.GradientTape() as tape:
-                y_pred = self.model_shards[0](x, training=True)
+            if keras.backend.backend() == "torch":
+            # Set gradients to zero
+                self.optimizer.zero_grad()
+                
+                # Forward pass
+                y_pred = self(x, training=True)
                 loss = self.compute_loss(x, y, y_pred, sample_weight)
-            gradients = tape.gradient(loss, self.trainable_variables)
-            self.optimizer.apply(gradients, self.trainable_variables)
+                
+                # Backward pass
+                # In PyTorch backend, loss is a torch.Tensor with a .backward() method
+                loss.backward()
+                
+                # Optimizer step
+                self.optimizer.step()
+            else:
+                with keras.backend.GradientTape() as tape:
+                    y_pred = self.model_shards[0](x, training=True)
+                    loss = self.compute_loss(x, y, y_pred, sample_weight)
+                gradients = tape.gradient(loss, self.trainable_variables)
+                self.optimizer.apply(gradients, self.trainable_variables)
             for metric in self.metrics:
                 if metric.name == "loss":
                     metric.update_state(loss)
@@ -551,7 +565,7 @@ class TensorParallelKeras:
                     metric.update_state(y, y_pred, sample_weight)
             return {m.name: m.result() for m in self.metrics}
 
-        with tf.GradientTape() as tape:
+        with keras.backend.GradientTape() as tape:
             y_pred = self(x, training=True)
             loss = self.compute_loss(x, y, y_pred, sample_weight)
 

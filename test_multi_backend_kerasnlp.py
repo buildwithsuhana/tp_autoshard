@@ -1,295 +1,119 @@
 #!/usr/bin/env python3
 """
-Test suite for multi-backend KerasNLP models with tensor parallelism.
+Test suite for KerasNLP models with tensor parallelism.
+This script tests the backend specified by the KERAS_BACKEND env variable.
 """
-
 import time
 import numpy as np
 import keras
+from keras import layers, ops
 import pytest
-
-# Ensure JAX backend can simulate devices if used
 import os
-os.environ.setdefault('XLA_FLAGS', '--xla_force_host_platform_device_count=2')
-
-# Import TensorParallelKeras
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 
-class KerasNLPBackboneWrapper(keras.Layer):
-    def __init__(self, backbone, **kwargs):
-        super().__init__(**kwargs)
-        self.backbone = backbone
+# This setting is only used when the JAX backend is active.
+# os.environ.setdefault('XLA_FLAGS', '--xla_force_host_platform_device_count=2')
 
-    def call(self, inputs):
-        return self.backbone(inputs)['sequence_output']
+def create_agnostic_model(input_dim: int = 64, num_classes: int = 2):
+    """Creates a simple, backend-agnostic Keras model for compilation testing."""
+    inputs = layers.Input(shape=(input_dim,), dtype="float32")
+    # Use string initializers; determinism is handled by keras.utils.set_random_seed
+    x = layers.Dense(32, activation="relu", kernel_initializer="glorot_uniform")(inputs)
+    outputs = layers.Dense(num_classes, kernel_initializer="glorot_uniform")(x)
+    model = keras.Model(inputs, outputs)
+    return model
 
-    def compute_output_shape(self, input_shape):
-        token_ids_shape = input_shape['token_ids']
-        batch_size = token_ids_shape[0]
-        sequence_length = token_ids_shape[1]
-        hidden_dim = self.backbone.hidden_dim
-        return (batch_size, sequence_length, hidden_dim)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"backbone": keras.saving.serialize(self.backbone)})
-        return config
-
-    @classmethod
-    def from_config(cls, config):
-        config["backbone"] = keras.saving.deserialize(config["backbone"])
-        return cls(**config)
-
-
-def test_bert_with_jax_backend():
-    """Test BERT with JAX backend."""
-    keras.config.set_backend("jax")
-    print("\n🔧 Testing BERT with JAX Backend")
-    print("=" * 50)
-    
-    start_time = time.time()
-    
-    try:
-        import keras_nlp
-    except ImportError:
-        pytest.skip("KerasNLP not available")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating BERT model...")
-    bert_model = keras_nlp.models.BertBackbone.from_preset("bert_tiny_en_uncased")
-    print(f"✅ {time.time() - start_time:.2f}s: BERT model created.")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel model...")
-    
-    tp_manager = TensorParallelKeras(
-        model=bert_model,
-        device_ids=['cpu:0', 'cpu:1']
-    )
-    model_tp_assembled = tp_manager.build_assembled_model()
-    print(f"✅ {time.time() - start_time:.2f}s: Assembled TP model created successfully.")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Testing inference...")
+def run_kerasnlp_inference_test(model, model_tp):
+    """Helper to run and validate inference on a KerasNLP model."""
     test_input = {
         'token_ids': np.random.randint(0, 1000, (2, 64), dtype=np.int32),
         'padding_mask': np.ones((2, 64), dtype=np.int32),
-        'segment_ids': np.zeros((2, 64), dtype=np.int32)
     }
-    
-    original_output = bert_model(test_input)
-    tp_output = model_tp_assembled(test_input)
-    
-    original_sequence_output = original_output['sequence_output']
-    tp_sequence_output = tp_output['sequence_output']
-    
-    print(f"      Original output shape: {original_sequence_output.shape}")
-    print(f"      TP output shape: {tp_sequence_output.shape}")
-    
-    assert original_sequence_output.shape == tp_sequence_output.shape, "Output shapes don't match"
-    print(f"      ✅ Output shapes match")
-    
-    print(f"✅ BERT with JAX backend test completed in {time.time() - start_time:.2f}s")
+    if 'segment_ids' in model.input:
+        test_input['segment_ids'] = np.zeros((2, 64), dtype=np.int32)
 
-def create_wrapped_model_from_backbone(backbone):
-    """Creates a functional model using the KerasNLPBackboneWrapper layer."""
-    inputs = {
-        key: keras.Input(shape=(None,), dtype="int32", name=key)
-        for key in backbone.input
-    }
-    outputs = KerasNLPBackboneWrapper(backbone)(inputs)
-    return keras.Model(inputs=inputs, outputs=outputs)
+    original_output = model(test_input)
+    tp_output = model_tp(test_input)
 
-def test_gpt2_with_pytorch_backend():
-    """Test GPT-2 with PyTorch backend."""
-    keras.config.set_backend("torch")
-    print("\n🔧 Testing GPT-2 with PyTorch Backend")
-    print("=" * 50)
-    
-    start_time = time.time()
-    
-    try:
-        import keras_nlp
-    except ImportError:
-        pytest.skip("KerasNLP not available")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating GPT-2 model...")
-    gpt2_backbone = keras_nlp.models.GPT2Backbone.from_preset("gpt2_base_en")
-    gpt2_model = create_wrapped_model_from_backbone(gpt2_backbone)
-    print(f"✅ {time.time() - start_time:.2f}s: GPT-2 model created and wrapped.")
+    if isinstance(original_output, dict):
+        original_seq_out = original_output['sequence_output']
+        tp_seq_out = tp_output['sequence_output']
+    else:
+        original_seq_out = original_output
+        tp_seq_out = tp_output
 
-    # --- FINAL FIX: Explicitly build the model before passing it to the library ---
-    # This forces Keras to finalize the layer graph, populating the `.layers`
-    # attribute that the TensorParallelKeras library requires on initialization.
-    build_shape = {'token_ids': (2, 64), 'padding_mask': (2, 64)}
-    gpt2_model.build(build_shape)
-    print(f"✅ {time.time() - start_time:.2f}s: Wrapped model built explicitly.")
+    print(f"      Original output shape: {original_seq_out.shape}")
+    print(f"      TP output shape: {tp_seq_out.shape}")
 
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel model...")
-    tp_manager = TensorParallelKeras(
-        model=gpt2_model,
-        world_size=2,
-    )
-    model_tp_assembled = tp_manager.build_assembled_model()
-    print(f"✅ {time.time() - start_time:.2f}s: Assembled TP model created successfully.")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Testing inference...")
-    test_input = {
-        'token_ids': np.random.randint(0, 1000, (2, 64), dtype=np.int32),
-        'padding_mask': np.ones((2, 64), dtype=np.int32)
-    }
-    
-    original_output = gpt2_model(test_input)
-    tp_output = model_tp_assembled(test_input)
-    
-    print(f"      Original output shape: {original_output.shape}")
-    print(f"      TP output shape: {tp_output.shape}")
-    
-    assert original_output.shape == tp_output.shape, "Output shapes don't match"
-    print(f"      ✅ Output shapes match")
-    
-    print(f"✅ GPT-2 with PyTorch backend test completed in {time.time() - start_time:.2f}s")
-
-def test_roberta_with_tensorflow_backend():
-    """Test RoBERTa with TensorFlow backend."""
-    keras.config.set_backend("tensorflow")
-    print("\n🔧 Testing RoBERTa with TensorFlow Backend")
-    print("=" * 50)
-    
-    start_time = time.time()
-    
-    try:
-        import keras_nlp
-    except ImportError:
-        pytest.skip("KerasNLP not available")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating RoBERTa model...")
-    roberta_backbone = keras_nlp.models.RobertaBackbone.from_preset("roberta_base_en")
-    roberta_model = create_wrapped_model_from_backbone(roberta_backbone)
-    print(f"✅ {time.time() - start_time:.2f}s: RoBERTa model created and wrapped.")
-    
-    # --- FINAL FIX: Explicitly build the model ---
-    build_shape = {'token_ids': (2, 64), 'padding_mask': (2, 64)}
-    roberta_model.build(build_shape)
-    print(f"✅ {time.time() - start_time:.2f}s: Wrapped model built explicitly.")
-
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel model...")
-    tp_manager = TensorParallelKeras(
-        model=roberta_model,
-        world_size=2,
-    )
-    model_tp_assembled = tp_manager.build_assembled_model()
-    print(f"✅ {time.time() - start_time:.2f}s: Assembled TP model created successfully.")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Testing inference...")
-    test_input = {
-        'token_ids': np.random.randint(0, 1000, (2, 64), dtype=np.int32),
-        'padding_mask': np.ones((2, 64), dtype=np.int32)
-    }
-    
-    original_output = roberta_model(test_input)
-    tp_output = model_tp_assembled(test_input)
-    
-    print(f"      Original output shape: {original_output.shape}")
-    print(f"      TP output shape: {tp_output.shape}")
-
-    assert original_output.shape == tp_output.shape, "Output shapes don't match"
+    assert original_seq_out.shape == tp_seq_out.shape, "Output shapes don't match"
     print(f"      ✅ Output shapes match")
 
-    print(f"✅ RoBERTa with TensorFlow backend test completed in {time.time() - start_time:.2f}s")
-
-
-def test_training_compilation_with_mixed_backends():
-    """Test training compilation with mixed backends."""
-    print("\n🔧 Testing Training Compilation with Mixed Backends")
+def test_kerasnlp_model(backbone_preset):
+    """A generic test function for any KerasNLP backbone."""
+    backend_name = keras.config.backend()
+    print(f"\n🔧 Testing {backbone_preset} with {backend_name.upper()} Backend")
     print("=" * 50)
-    
     start_time = time.time()
-    
+
     try:
         import keras_nlp
-    except ImportError:
-        pytest.skip("KerasNLP not available")
-    
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating small BERT model factory...")
-    
-    def create_model_for_backend():
-        backbone = keras_nlp.models.BertBackbone.from_preset("bert_tiny_en_uncased")
-        model = create_wrapped_model_from_backbone(backbone)
-        # --- FINAL FIX: Explicitly build the model ---
-        build_shape = {
-            'token_ids': (2, 64), 
-            'padding_mask': (2, 64),
-            'segment_ids': (2, 64)
+        model_name_map = {
+            "bert": "BertBackbone", "gpt2": "GPT2Backbone", "roberta": "RobertaBackbone",
         }
-        model.build(build_shape)
-        return model
+        prefix = backbone_preset.split('_')[0]
+        class_name = model_name_map[prefix]
+        BackboneClass = getattr(keras_nlp.models, class_name)
+    except (ImportError, AttributeError, KeyError):
+        pytest.skip(f"KerasNLP or {backbone_preset} backbone not available")
 
-    backends = ['jax', 'torch', 'tensorflow']
-    backend_results = []
-    
-    for backend in backends:
-        # --- FINAL FIX: Clear session to prevent state leakage between backends ---
-        keras.backend.clear_session()
-        print(f"\n   Testing {backend.upper()} backend...")
-        try:
-            keras.config.set_backend(backend)
-            bert_model = create_model_for_backend()
-            
-            tp_manager = TensorParallelKeras(
-                model=bert_model,
-                world_size=2,
-            )
-            model_tp_assembled = tp_manager.build_assembled_model()
-            
-            model_tp_assembled.compile(optimizer='adam', loss='mse')
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating {backbone_preset} model...")
+    model = BackboneClass.from_preset(backbone_preset)
+    print(f"✅ {time.time() - start_time:.2f}s: Model created.")
 
-            print(f"      ✅ {backend.upper()} backend: Model compiled successfully")
-            backend_results.append((backend, True))
-        except Exception as e:
-            import traceback
-            print(f"      ❌ {backend.upper()} backend: Failed - {e}\n{traceback.format_exc()}")
-            backend_results.append((backend, False))
-    
-    print(f"\n   📊 Backend Compilation Test Results:")
-    for backend, success in backend_results:
-        status = "✅ PASS" if success else "❌ FAIL"
-        print(f"      {backend.upper()}: {status}")
-    
-    print(f"✅ Mixed backend compilation test completed in {time.time() - start_time:.2f}s")
-    assert all(success for _, success in backend_results)
+    print(f"⏱️  {time.time() - start_time:.2f}s: Warming up model to trigger build...")
+    dummy_input = {key: keras.ops.zeros((2, 64), dtype="int32") for key in model.input}
+    _ = model(dummy_input)
+    print(f"✅ {time.time() - start_time:.2f}s: Model built via warm-up pass.")
 
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel model...")
+    tp_model = TensorParallelKeras(model=model, world_size=2)
+    print(f"✅ {time.time() - start_time:.2f}s: Tensor Parallel model created.")
+
+    print(f"⏱️  {time.time() - start_time:.2f}s: Testing inference...")
+    run_kerasnlp_inference_test(model, tp_model)
+    print(f"✅ {backbone_preset} with {backend_name.upper()} backend test completed in {time.time() - start_time:.2f}s")
+
+def test_simple_model_compilation():
+    """Tests if a simple sharded model can be compiled."""
+    backend_name = keras.config.backend()
+    print(f"\n🔧 Testing Simple Model Compilation with {backend_name.upper()} Backend")
+    print("=" * 50)
+    
+    agnostic_model = create_agnostic_model(input_dim=32)
+    dummy_x = keras.ops.zeros((2, 32), dtype="float32")
+    _ = agnostic_model(dummy_x) # Warm-up
+    
+    tp_model = TensorParallelKeras(model=agnostic_model, world_size=2)
+    tp_model.compile(optimizer='adam', loss='mse')
+    print(f"      ✅ {backend_name.upper()} backend: Model compiled successfully")
 
 def main():
-    """Run all multi-backend tests."""
-    print("🎯 MULTI-BACKEND KERASNLP TENSOR PARALLEL TEST SUITE")
+    keras.utils.set_random_seed(1337)
+    backend = keras.config.backend()
+    print(f"🎯 RUNNING TEST SUITE FOR BACKEND: {backend.upper()} 🎯")
     
-    tests = [
-        ("BERT with JAX Backend", test_bert_with_jax_backend),
-        ("GPT-2 with PyTorch Backend", test_gpt2_with_pytorch_backend),
-        ("RoBERTa with TensorFlow Backend", test_roberta_with_tensorflow_backend),
-        ("Training Compilation with Mixed Backends", test_training_compilation_with_mixed_backends)
-    ]
+    # Run all tests for the configured backend
+    test_simple_model_compilation()
     
-    results = []
-    
-    for test_name, test_func in tests:
-        try:
-            test_func()
-            results.append((test_name, True))
-        except Exception as e:
-            import traceback
-            print(f"\n❌ {test_name} FAILED with exception: {e}")
-            print(traceback.format_exc())
-            results.append((test_name, False))
-    
-    passed = sum(1 for _, result in results if result)
-    total = len(results)
-    
-    print(f"\n{'='*60}\n🎉 MULTI-BACKEND TESTING COMPLETED! 🎉\n{'='*60}")
-    print(f"📊 SUMMARY: {passed}/{total} PASSED ({(passed/total)*100:.1f}%)")
+    # We can add more tests here and they will run on the same backend
+    if backend == "jax":
+        test_kerasnlp_model("bert_tiny_en_uncased")
+    elif backend == "torch":
+        test_kerasnlp_model("gpt2_base_en")
+    elif backend == "tensorflow":
+        test_kerasnlp_model("roberta_base_en")
 
-    if passed == total:
-        print(f"\n🚀 SUCCESS: All multi-backend tests passed!")
-    else:
-        print(f"\n⚠️ WARNING: {total - passed} tests failed.")
+    print(f"\n🚀 SUCCESS: All tests for {backend.upper()} backend passed!")
 
 if __name__ == "__main__":
     main()

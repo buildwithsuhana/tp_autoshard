@@ -110,7 +110,7 @@ def test_opt125m_inference_correctness():
     opt_model = create_opt125m_model()
     
     print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
-    tp_manager = TensorParallelKeras(model=opt_model, world_size=2, distributed_backend='fallback')
+    tp_manager = TensorParallelKeras(model=opt_model, world_size=4, distributed_backend='fallback')
     tp_model = tp_manager.build_assembled_model()
 
     print(f"✅ {time.time() - start_time:.2f}s: Models created successfully")
@@ -176,7 +176,7 @@ def test_opt125m_training_verification():
     print(f"      ✅ Initial weights saved.")
 
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel manager...")
-    tp_manager = TensorParallelKeras(model=model_template, world_size=2, distributed_backend='fallback')
+    tp_manager = TensorParallelKeras(model=model_template, world_size=4, distributed_backend='fallback')
     tp_model = tp_manager.build_assembled_model()
     
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating a separate baseline model...")
@@ -190,6 +190,23 @@ def test_opt125m_training_verification():
     base_optimizer = optimizers.Adam()
     base_optimizer.build(dummy_model_for_opt.trainable_variables)
     print(f"      ✅ TP optimizer is now built and has state variables.")
+
+    print("\n" + "="*20 + " Memory Savings Report " + "="*20)
+    try:
+        tp_manager.compile(optimizer=base_optimizer)
+        
+        if hasattr(tp_manager, 'optimizer') and hasattr(tp_manager.optimizer, 'coordinated_optimizer'):
+            memory_info = tp_manager.optimizer.coordinated_optimizer.get_memory_usage()
+            
+            print(f"      📈 Sharding Enabled: {memory_info.get('sharding_enabled', False)}")
+            print(f"      💾 Est. Memory w/o TP (replicated states): {memory_info.get('total_memory', 'N/A')}")
+            print(f"      💾 Est. Memory w/ TP (sharded states): {memory_info.get('sharded_memory', 'N/A')}")
+            print(f"      💰 Estimated Optimizer State Memory Savings: {memory_info.get('memory_savings', 'N/A')}")
+        else:
+            print("      ⚠️  Could not access coordinated_optimizer to report memory savings.")
+    except Exception as e:
+        print(f"      ❌ Failed to calculate memory savings: {e}")
+    print("=" * 61 + "\n")
 
     print(f"⏱️  {time.time() - start_time:.2f}s: Compiling models...")
     tp_model.compile(optimizer=base_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])

@@ -140,7 +140,7 @@ class TensorParallelKeras(keras.Model):
             return []
 
         all_weights = []
-        for model in self.sharded_models:
+        for model in self.model_shards:
             weight_collection = getattr(model, weight_collection_name)
             all_weights.extend(weight_collection)
         return list({id(w): w for w in all_weights}.values())
@@ -329,8 +329,7 @@ class TensorParallelKeras(keras.Model):
         if not self.distributed:
             return self.original_model(inputs, training=training, **kwargs)
 
-        partial_outputs = [model(inputs, training=training, **kwargs) for model in self.sharded_models]
-
+        partial_outputs = [model(inputs, training=training, **kwargs) for model in self.model_shards]
         if not partial_outputs:
             logger.warning("No shard outputs found, returning None.")
             return None
@@ -538,22 +537,15 @@ class TensorParallelKeras(keras.Model):
         """
 
         if not self.distributed:
+            import tensorflow as tf
             if keras.backend.backend() == "torch":
-            # Set gradients to zero
                 self.optimizer.zero_grad()
-                
-                # Forward pass
                 y_pred = self(x, training=True)
                 loss = self.compute_loss(x, y, y_pred, sample_weight)
-                
-                # Backward pass
-                # In PyTorch backend, loss is a torch.Tensor with a .backward() method
                 loss.backward()
-                
-                # Optimizer step
                 self.optimizer.step()
             else:
-                with keras.backend.GradientTape() as tape:
+                with tf.GradientTape() as tape:
                     y_pred = self.model_shards[0](x, training=True)
                     loss = self.compute_loss(x, y, y_pred, sample_weight)
                 gradients = tape.gradient(loss, self.trainable_variables)
@@ -565,7 +557,7 @@ class TensorParallelKeras(keras.Model):
                     metric.update_state(y, y_pred, sample_weight)
             return {m.name: m.result() for m in self.metrics}
 
-        with keras.backend.GradientTape() as tape:
+        with tf.GradientTape() as tape:
             y_pred = self(x, training=True)
             loss = self.compute_loss(x, y, y_pred, sample_weight)
 
@@ -682,14 +674,6 @@ class TensorParallelKeras(keras.Model):
             logger.warning(f"Upstream gradient slicing failed: {e}, using full gradients")
             return [full_gradients] * self.world_size
     
-    # NOTE: The methods below were removed as they implemented manual, backend-specific
-    # gradient computation which conflicts with the backend-agnostic Keras `train_step`.
-    # A proper Keras model defines its forward pass (`call`) and lets the framework
-    # handle the backward pass via automatic differentiation.
-    #
-    # _compute_shard_gradients_with_sliced_upstream(self, ...)
-    # _compute_shard_loss(self, ...)
-    
     def _detect_layer_sharding_type(self):
         """
         Detect the sharding type of the current model.
@@ -701,12 +685,10 @@ class TensorParallelKeras(keras.Model):
             if not hasattr(self, 'tensor_parallel_config') or self.tensor_parallel_config is None:
                 return "unknown"
             
-            # Check output rules for communication hints
             output_rules = self.tensor_parallel_config.output_rules
             if not output_rules:
                 return "unknown"
             
-            # Analyze the first output rule to determine sharding type
             first_rule = list(output_rules.values())[0] if output_rules else None
             if first_rule:
                 if "gather" in str(first_rule).lower():
@@ -714,10 +696,8 @@ class TensorParallelKeras(keras.Model):
                 elif "allreduce" in str(first_rule).lower():
                     return "row_parallel"
             
-            # Fallback: analyze model structure
             if hasattr(self, 'original_model') and self.original_model is not None:
                 if hasattr(self.original_model, 'layers') and self.original_model.layers:
-                    # Check if this looks like an MLP with up/down projections
                     layer_names = [layer.name.lower() for layer in self.original_model.layers]
                     if any("up" in name for name in layer_names) and any("down" in name for name in layer_names):
                         return "mlp_handshake"

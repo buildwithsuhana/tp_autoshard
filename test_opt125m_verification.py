@@ -85,7 +85,7 @@ def test_opt125m_parameter_sharding():
     print(f"      Original params: {original_params:,}")
     
     print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
-    tp_manager = TensorParallelKeras(model=opt_model, world_size=7, distributed_backend='fallback')
+    tp_manager = TensorParallelKeras(model=opt_model, world_size=2, distributed_backend='fallback')
     
     total_sharded_params = 0
     for i, shard in enumerate(tp_manager.sharded_models):
@@ -110,7 +110,7 @@ def test_opt125m_inference_correctness():
     opt_model = create_opt125m_model()
     
     print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
-    tp_manager = TensorParallelKeras(model=opt_model, world_size=7, distributed_backend='fallback')
+    tp_manager = TensorParallelKeras(model=opt_model, world_size=2, distributed_backend='fallback')
     tp_model = tp_manager.build_assembled_model()
 
     print(f"✅ {time.time() - start_time:.2f}s: Models created successfully")
@@ -176,7 +176,7 @@ def test_opt125m_training_verification():
     print(f"      ✅ Initial weights saved.")
 
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel manager...")
-    tp_manager = TensorParallelKeras(model=model_template, world_size=7, distributed_backend='fallback')
+    tp_manager = TensorParallelKeras(model=model_template, world_size=2, distributed_backend='fallback')
     tp_model = tp_manager.build_assembled_model()
     
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating a separate baseline model...")

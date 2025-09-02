@@ -5,7 +5,6 @@ Handles parameter splitting, gathering, and reduction operations
 from typing import Any, Sequence
 import keras
 
-
 class StateActionKeras:
     """Base class for state actions."""
     

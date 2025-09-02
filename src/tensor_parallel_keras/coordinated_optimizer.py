@@ -1,27 +1,12 @@
-"""
-Coordinated Optimizer for Keras Tensor Parallel
-Coordinates parameter updates across multiple model shards
-"""
-
-try:
-    import torch
-except Exception:
-    torch = None
-try:
-    import torch  # type: ignore
-except Exception:  # torch is optional; allow JAX-only usage
-    torch = None  # type: ignore
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import keras
 from keras import optimizers
 import logging
 
-# Import our new distributed backend
 try:
     from .distributed_backend import get_distributed_backend, DistributedBackend
 except ImportError:
-    # Fallback if distributed backend is not available
     DistributedBackend = None
     get_distributed_backend = None
 
@@ -29,10 +14,6 @@ logger = logging.getLogger(__name__)
 
 
 class CoordinatedOptimizer:
-    """
-    Optimizer that coordinates updates across multiple model shards with SHARDED optimizer states.
-    Implements true tensor parallelism by partitioning optimizer states across devices.
-    """
     def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int,
                  distributed_backend: str = 'auto', rank: int = 0, shard_optimizer_states: bool = True, tensor_parallel_config=None):
 
@@ -63,10 +44,6 @@ class CoordinatedOptimizer:
                 self._initialize_sharded_states()
 
     def _get_actual_optimizer_state(self) -> Dict[str, Any]:
-        """
-        [NEW METHOD] Inspects a PRE-BUILT optimizer and extracts its actual state variables
-        into the nested dictionary format this class expects.
-        """
         state_dict = {}
 
         for var in self.base_optimizer.variables:
@@ -109,7 +86,6 @@ class CoordinatedOptimizer:
         return state_dict
     
     def _initialize_sharded_states(self):
-        """Initialize sharded optimizer states across devices."""
         logger.info("Initializing sharded optimizer states...")
         
         try:
@@ -170,16 +146,12 @@ class CoordinatedOptimizer:
             return {'dummy': np.array([0.0])}
     
     def _partition_state_across_shards(self, state_variable):
-        """Partition a single state value across shards."""
         try:
-            # Construct a zero buffer with the same shape/dtype to avoid backend reads
             shape = tuple(getattr(state_variable, 'shape', ()))
-            # Determine element size/dtype
             dtype = None
             if hasattr(state_variable, 'dtype'):
                 dt = state_variable.dtype
                 try:
-                    # TensorFlow dtype
                     if hasattr(dt, 'as_numpy_dtype'):
                         dtype = np.dtype(dt.as_numpy_dtype)
                     else:
@@ -190,12 +162,9 @@ class CoordinatedOptimizer:
                 dtype = np.float32
 
             state_array = np.zeros(shape, dtype=dtype)
-
-            # Split along the first dimension. If it's a scalar, it will be replicated.
             if state_array.ndim > 0 and shape[0] not in (None, 0):
                 return np.array_split(state_array, self.world_size, axis=0)
             else:
-                # Replicate scalar or unknown-first-dim values
                 return [np.zeros((), dtype=dtype)] * self.world_size
                 
         except Exception as e:
@@ -203,7 +172,6 @@ class CoordinatedOptimizer:
             return [state_variable] * self.world_size
     
     def get_config(self):
-        """Get optimizer configuration."""
         return {
             'base_optimizer': self.base_optimizer.get_config(),
             'world_size': self.world_size,
@@ -211,38 +179,24 @@ class CoordinatedOptimizer:
         }
     
     def apply_gradients(self, gradients_and_vars: List[List[tuple]], shard_models: List):
-        """
-        Apply gradients to all shards with SHARDED optimizer states.
-        
-        Args:
-            gradients_and_vars: List of (gradient, variable) pairs for each shard
-            shard_models: List of model shards
-        """
         if len(gradients_and_vars) != self.world_size:
             raise ValueError(f"Expected {self.world_size} gradient sets, got {len(gradients_and_vars)}")
         
-        # Synchronize gradients across shards
         synchronized_gradients = self._synchronize_gradients(gradients_and_vars)
         
         if self.shard_optimizer_states and self.sharded_states:
-            # Use sharded optimizer states for true tensor parallelism
             logger.info("Applying gradients with SHARDED optimizer states")
             self._apply_gradients_with_sharded_states(synchronized_gradients, shard_models)
         else:
-            # Fallback: use replicated optimizer states
             logger.info("Applying gradients with REPLICATED optimizer states")
             self._apply_gradients_with_replicated_states(synchronized_gradients, shard_models)
     
     def _apply_gradients_with_sharded_states(self, synchronized_gradients: List[List[tuple]], shard_models: List):
-        """Apply gradients using sharded optimizer states (true tensor parallelism)."""
         try:
             for shard_idx, (shard_grads, shard_model) in enumerate(zip(synchronized_gradients, shard_models)):
                 logger.info(f"Updating shard {shard_idx} with sharded optimizer states")
                 
-                # Get the shard's local portion of optimizer states
                 local_states = self._get_local_optimizer_states(shard_idx)
-                
-                # Apply gradients using local sharded states
                 self._update_shard_with_local_states(shard_idx, shard_grads, shard_model, local_states)
                 
         except Exception as e:
@@ -250,12 +204,10 @@ class CoordinatedOptimizer:
             self._apply_gradients_with_replicated_states(synchronized_gradients, shard_models)
     
     def _apply_gradients_with_replicated_states(self, synchronized_gradients: List[List[tuple]], shard_models: List):
-        """Apply gradients using replicated optimizer states (fallback)."""
         for i, (shard_opt, shard_model) in enumerate(zip(self.shard_optimizers, shard_models)):
             shard_opt.apply_gradients(synchronized_gradients[i])
     
     def _get_local_optimizer_states(self, shard_idx: int):
-        """Get the local portion of optimizer states for a specific shard."""
         local_states = {}
         
         for state_name, state_value in self.sharded_states.items():
@@ -276,7 +228,6 @@ class CoordinatedOptimizer:
     
     def _update_shard_with_local_states(self, shard_idx: int, shard_grads: List[tuple], 
                                       shard_model, local_states: dict):
-        """Update a specific shard using its local optimizer states."""
         try:
             shard_opt = self.shard_optimizers[shard_idx]
             self._update_optimizer_internal_state(shard_opt, local_states)
@@ -288,27 +239,18 @@ class CoordinatedOptimizer:
             shard_opt.apply_gradients(shard_grads)
 
     def _update_optimizer_internal_state(self, optimizer, local_states: dict):
-        """
-        Update the optimizer's internal state with local sharded states.
-        This is a complete, functional implementation.
-        """
         try:
             if not hasattr(optimizer, 'variables') or not optimizer.variables:
                 logger.warning(f"Optimizer '{optimizer.name}' has no variables to update. It may not be built yet.")
                 return
 
-            # --- Step 1: Create a lookup map from a clean key to the optimizer's actual Variable objects ---
-            # This allows us to easily find the right variable to update.
             optimizer_var_map = {}
             for var in optimizer.variables:
-                # Use the same robust name-parsing logic from _get_actual_optimizer_state
-                # to ensure the keys we create here will match the keys in `local_states`.
                 identifier = getattr(var, 'path', getattr(var, 'name', str(var)))
                 parts = identifier.split('/')
                 tail = parts[-1]
                 tail_lower = tail.lower()
 
-                # Handle scalar states like iteration ('t') and learning rate ('lr')
                 if 'iteration' in tail_lower or tail_lower in {'iter', 't'}:
                     optimizer_var_map[('t', None)] = var
                     continue
@@ -316,7 +258,6 @@ class CoordinatedOptimizer:
                     optimizer_var_map[('lr', None)] = var
                     continue
 
-                # Handle parameter-specific states like momentum, Adam's 'm' and 'v', etc.
                 state_name = None
                 param_name_in_opt = None
                 
@@ -334,22 +275,19 @@ class CoordinatedOptimizer:
                     param_name_in_opt = tail[:-len('_v')]
 
                 if state_name and param_name_in_opt:
-                    # The key is a tuple: (state_type, parameter_name) e.g., ('m', 'dense_kernel')
                     optimizer_var_map[(state_name, param_name_in_opt)] = var
 
-            # --- Step 2: Iterate through the local sharded states and update the optimizer's variables ---
             updated_vars_count = 0
             for state_name, state_value in local_states.items():
-                if isinstance(state_value, dict):  # For states like 'm' and 'v' that are dicts of param states
+                if isinstance(state_value, dict):
                     for param_name, local_param_state in state_value.items():
                         key = (state_name, param_name)
                         if key in optimizer_var_map:
-                            # Use the .assign() method to update the variable's value
                             optimizer_var_map[key].assign(local_param_state)
                             updated_vars_count += 1
                         else:
                             logger.warning(f"Could not find matching variable in optimizer for local state '{state_name}/{param_name}'.")
-                else:  # For scalar states like 't'
+                else:
                     key = (state_name, None)
                     if key in optimizer_var_map:
                         optimizer_var_map[key].assign(state_value)
@@ -364,10 +302,6 @@ class CoordinatedOptimizer:
             logger.error(f"Failed to update optimizer internal state for '{optimizer.name}': {e}", exc_info=True)
     
     def _synchronize_gradients(self, gradients_and_vars: List[List[tuple]]) -> List[List[tuple]]:
-        """
-        Synchronize gradients intelligently based on the sharding config,
-        only applying All-Reduce where necessary.
-        """
         if not self.tensor_parallel_config:
             return gradients_and_vars
 
@@ -402,82 +336,43 @@ class CoordinatedOptimizer:
         return gradients_and_vars
     
     def _allreduce_gradients(self, gradients: List[Any]) -> List[Any]:
-        """
-        REAL AllReduce operation for gradients using distributed backend.
-        
-        Args:
-            gradients: List of gradients from each shard
-            
-        Returns:
-            List of synchronized gradients for each shard
-        """
         if self.distributed_backend is not None and self.distributed_backend.is_initialized:
             try:
                 logger.info("Using REAL distributed backend for AllReduce")
-                
-                numpy_gradients = []
-                for grad in gradients:
-                    if hasattr(grad, 'numpy'):
-                        numpy_gradients.append(grad.numpy())
-                    elif (torch is not None) and isinstance(grad, torch.Tensor):
-                        numpy_gradients.append(grad.cpu().numpy())
-                    else:
-                        numpy_gradients.append(np.array(grad))
+                numpy_gradient = keras.ops.convert_to_numpy(gradients[0])
                 
                 synchronized_numpy = self.distributed_backend.allreduce(
-                    numpy_gradients[0], op='mean'
+                    numpy_gradient, op='mean'
                 )
-                
-                synchronized_gradients = []
-                for i in range(self.world_size):
-                    torch_grad = torch.tensor(synchronized_numpy)
-                    synchronized_gradients.append(torch_grad)
-                
+                synchronized_tensor = keras.ops.convert_to_tensor(synchronized_numpy)
+                synchronized_gradients = [synchronized_tensor for _ in range(self.world_size)]
+            
                 logger.info(f"REAL AllReduce completed using {type(self.distributed_backend).__name__}")
                 return synchronized_gradients
                 
             except Exception as e:
-                logger.warning(f"Real distributed AllReduce failed: {e}, falling back to simulation")
-        
-        logger.warning("Using SIMULATION for AllReduce - NOT production-ready!")
-        
-        torch_gradients = []
-        for grad in gradients:
-            if hasattr(grad, 'numpy'):
-                torch_gradients.append(torch.tensor(grad.numpy()))
-            elif isinstance(grad, torch.Tensor):
-                torch_gradients.append(grad)
-            else:
-                torch_gradients.append(torch.tensor(grad))
-        total = sum(torch_gradients)
-        mean_grad = total / self.world_size
-        
-        synchronized_gradients = []
-        for i in range(self.world_size):
-            try:
-                noise_scale = 0.001 * mean_grad.abs().mean()
-                if noise_scale > 0:
-                    noise = torch.randn_like(mean_grad) * noise_scale
-                    synchronized_grad = mean_grad + noise
-                else:
-                    synchronized_grad = mean_grad.clone()
-            except:
-                synchronized_grad = mean_grad.clone()
+                logger.warning(f"Real distributed AllReduce failed: {e}. Falling back to simulation.")        
+        if not gradients:
+            return []
             
-            synchronized_gradients.append(synchronized_grad)
+        keras_gradients = [keras.ops.convert_to_tensor(grad) for grad in gradients]
+        stacked_gradients = keras.ops.stack(keras_gradients, axis=0)
         
-        logger.info(f"SIMULATION AllReduce completed for gradients with shape {mean_grad.shape}")
+        total_gradients = keras.ops.sum(stacked_gradients, axis=0)
+        mean_grad = total_gradients / self.world_size
+        
+        synchronized_gradients = [keras.ops.copy(mean_grad) for _ in range(self.world_size)]
+        
+        logger.info(f"SIMULATION AllReduce completed for gradients with shape {keras.ops.shape(mean_grad)}")
         return synchronized_gradients
     
     def get_weights(self):
-        """Get optimizer weights."""
         weights = []
         for opt in self.shard_optimizers:
             weights.extend(opt.get_weights())
         return weights
     
     def set_weights(self, weights):
-        """Set optimizer weights."""
         weights_per_shard = len(weights) // self.world_size
         for i, opt in enumerate(self.shard_optimizers):
             start_idx = i * weights_per_shard
@@ -486,7 +381,6 @@ class CoordinatedOptimizer:
             opt.set_weights(shard_weights)
     
     def get_memory_usage(self):
-        """Get memory usage information for the coordinated optimizer."""
         try:
             def _bytes_for_var(var) -> int:
                 try:
@@ -600,7 +494,6 @@ class CoordinatedOptimizer:
 
     
     def enable_optimizer_state_sharding(self):
-        """Enable optimizer state sharding."""
         if not self.shard_optimizer_states:
             logger.info("Enabling optimizer state sharding...")
             self.shard_optimizer_states = True
@@ -610,7 +503,6 @@ class CoordinatedOptimizer:
             logger.info("Optimizer state sharding already enabled")
     
     def disable_optimizer_state_sharding(self):
-        """Disable optimizer state sharding (fallback to replicated states)."""
         if self.shard_optimizer_states:
             logger.info("Disabling optimizer state sharding...")
             self.shard_optimizer_states = False
@@ -620,7 +512,6 @@ class CoordinatedOptimizer:
             logger.info("Optimizer state sharding already disabled")
 
     def _get_sharded_states_structure(self):
-        """Get the structure of sharded states for analysis."""
         if not hasattr(self, 'sharded_states') or not self.sharded_states:
             return {'error': 'States are not sharded or initialized.'}
         
@@ -642,19 +533,8 @@ class CoordinatedOptimizer:
 
 
 class TensorParallelOptimizer(optimizers.Optimizer):
-    """
-    Wrapper that makes any Keras optimizer tensor parallel compatible.
-    Inherits from keras.Optimizer for compatibility.
-    """
     
     def __init__(self, base_optimizer: optimizers.Optimizer, world_size: int, distributed_backend: str = 'auto', tensor_parallel_config=None):
-        """
-        Initialize tensor parallel optimizer.
-        
-        Args:
-            base_optimizer: Base Keras optimizer
-            world_size: Number of model shards
-        """
         lr = 0.001
         if hasattr(base_optimizer, 'learning_rate'):
             try:
@@ -697,7 +577,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         self.base_optimizer = base_optimizer
     
     def apply_gradients(self, gradients_and_vars, **kwargs):
-        """Apply gradients with coordination."""
         if isinstance(gradients_and_vars, list) and len(gradients_and_vars) > 0:
             if isinstance(gradients_and_vars[0], list):
                 shard_models = kwargs.get('shard_models', [])
@@ -708,7 +587,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             return self._apply_standard_gradients(gradients_and_vars)
     
     def _apply_standard_gradients(self, gradients_and_vars):
-        """Apply gradients in standard Keras format."""
         try:
             self.base_optimizer.apply_gradients(gradients_and_vars)
             return gradients_and_vars
@@ -716,7 +594,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             return gradients_and_vars
            
     def get_config(self):
-        """Get optimizer configuration."""
         config = super().get_config()
         config.update({
             'base_optimizer': self.base_optimizer.get_config(),
@@ -725,11 +602,9 @@ class TensorParallelOptimizer(optimizers.Optimizer):
         return config
     
     def get_weights(self):
-        """Get optimizer weights."""
         return self.coordinated_optimizer.get_weights()
     
     def set_weights(self, weights):
-        """Set optimizer weights."""
         return self.coordinated_optimizer.set_weights(weights)
     
     def update_step(self, gradient, variable, *args, **kwargs):

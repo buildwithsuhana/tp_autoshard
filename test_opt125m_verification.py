@@ -182,7 +182,8 @@ def test_opt125m_training_verification():
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating a separate baseline model...")
     baseline_model = create_simplified_opt125m_model()
     
-    baseline_model.set_weights(initial_weights)
+    x = baseline_model.set_weights(initial_weights)
+    print(x)
     print(f"      ✅ Baseline model weights set to match the template.")
 
     print(f"⏱️  {time.time() - start_time:.2f}s: Creating and pre-building the TP optimizer...")

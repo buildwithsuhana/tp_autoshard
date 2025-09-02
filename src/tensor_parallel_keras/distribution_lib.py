@@ -1,8 +1,6 @@
 """
 Distribution Library for Tensor Parallel Keras.
-
 This module provides device detection and management.
-It's updated to correctly detect simulated devices for the JAX backend.
 """
 
 import logging
@@ -12,16 +10,6 @@ import keras
 logger = logging.getLogger(__name__)
 
 def list_devices() -> List[str]:
-    """
-    List all available devices.
-    
-    This function is updated to correctly detect simulated devices when
-    using the JAX backend with flags like XLA_FLAGS. It falls back to
-    checking physical devices for other backends.
-    
-    Returns:
-        List of device identifiers in priority order (TPU > GPU > CPU)
-    """
     if keras.backend.backend() == 'torch':
         try:
             import torch

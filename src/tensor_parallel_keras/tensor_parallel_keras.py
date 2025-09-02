@@ -8,14 +8,13 @@ from typing import Collection, Optional, Sequence, Union
 import re
 import numpy as np
 import keras
-from keras import device
 
 from .autoconfig_keras import get_default_config_keras
 from .parameter_sharding import make_parameter_sharded_model
 from .sharding_keras import ShardedKeras
 from .coordinated_optimizer import TensorParallelOptimizer
-from .parameter_sharding import ShardedWeight
 from .distribution_lib import get_best_devices
+
 logger = logging.getLogger(__file__)
 
 class TensorParallelKeras(keras.Model):
@@ -25,7 +24,6 @@ class TensorParallelKeras(keras.Model):
         print("=" * 50)
         print("TensorParallelKeras Manager __init__ called!")
         print("=" * 50)
-        
         
         self.original_model = model
         self.world_size = world_size if world_size is not None else 1
@@ -37,7 +35,6 @@ class TensorParallelKeras(keras.Model):
             return
 
         self.distributed = True
-        # self.devices = [f"cpu:{i}" for i in range(self.world_size)] 
 
         self.devices = get_best_devices(self.world_size)
         self.tensor_parallel_config = get_default_config_keras(model, self.devices)
@@ -247,7 +244,6 @@ class TensorParallelKeras(keras.Model):
             except Exception as e:
                 logger.debug(f"TPU detection failed: {e}")
             
-            # Check for GPU devices
             try:
                 gpu_devices = keras.config.list_physical_devices('GPU')
                 if gpu_devices:
@@ -258,7 +254,6 @@ class TensorParallelKeras(keras.Model):
             except Exception as e:
                 logger.debug(f"GPU detection failed: {e}")
             
-            # Check for CPU devices
             try:
                 cpu_devices = keras.config.list_physical_devices('CPU')
                 if cpu_devices:
@@ -269,7 +264,6 @@ class TensorParallelKeras(keras.Model):
             except Exception as e:
                 logger.debug(f"CPU detection failed: {e}")
             
-            # If no devices found, add default CPU
             if not devices:
                 logger.warning("No devices detected, using default CPU")
                 devices.append("cpu:0")
@@ -299,7 +293,6 @@ class TensorParallelKeras(keras.Model):
             elif device_spec.startswith("gpu:"):
                 return device_spec
             elif device_spec.startswith("cuda:"):
-                # Convert CUDA format to GPU format
                 return f"gpu:{device_spec.split(':')[1]}"
             else:
                 return device_spec
@@ -311,7 +304,6 @@ class TensorParallelKeras(keras.Model):
         if replicated_param_names is None:
             replicated_param_names = self.modified_parameters_names
             
-        # Create sharding manager
         self.sharding_manager = ShardedKeras(
             self.model_shards,
             replicated_param_names,
@@ -369,11 +361,6 @@ class TensorParallelKeras(keras.Model):
 
 
     def _apply_forward_communication(self, inputs, training=None, **kwargs):
-        """
-        Apply forward pass communication following the conjugate rule.
-        This corrected version uses the tensor_parallel_config as the source of truth
-        for sharding strategies, making it much more robust.
-        """
         partial_outputs = list(self.shard_outputs.values())
         if not partial_outputs:
             logger.warning("No shard outputs found, returning None.")
@@ -613,10 +600,8 @@ class TensorParallelKeras(keras.Model):
             elif "row" in layer_type.lower() or "down_projection" in layer_type.lower():
                 logger.info("   - Backward row-parallel: AllGathering gradients")
                 gathered = communicator.backward_row_parallel(gradients, dim=-1)
-                # Convert back to list format for optimizer
                 return [gathered] * self.world_size
             else:
-                # Unknown layer type - return original gradients
                 logger.debug(f"Unknown layer type '{layer_type}', skipping backward communication")
                 return gradients
                 
@@ -650,19 +635,16 @@ class TensorParallelKeras(keras.Model):
             
             for rank in range(self.world_size):
                 if sharding_type == "column_parallel":
-                    # Column-parallel: Slice along feature dimension (usually -1)
                     sliced_grad = communicator.slice_upstream_gradient_for_column_parallel(
                         full_gradients, rank, self.world_size, dim=-1
                     )
                     logger.debug(f"   - Rank {rank}: Sliced upstream gradient for column-parallel")
                 elif sharding_type == "row_parallel":
-                    # Row-parallel: Slice along batch dimension (usually 0)
                     sliced_grad = communicator.slice_upstream_gradient_for_row_parallel(
                         full_gradients, rank, self.world_size, dim=0
                     )
                     logger.debug(f"   - Rank {rank}: Sliced upstream gradient for row-parallel")
                 else:
-                    # Unknown sharding type - use full gradient (fallback)
                     logger.warning(f"Unknown sharding type '{sharding_type}', using full gradient")
                     sliced_grad = full_gradients
                 
@@ -743,7 +725,7 @@ class TensorParallelKeras(keras.Model):
         config.update({
             "model": self.original_model,
             "device_ids": self.devices,
-            "output_device_index": 0,  # Use first device index
+            "output_device_index": 0,
             "sharded": hasattr(self, 'sharding_manager') and self.sharding_manager is not None
         })
         return config 
@@ -753,17 +735,14 @@ class TensorParallelKeras(keras.Model):
         try:
             from .distribution_lib import list_devices, get_best_devices
             
-            # Get all available devices
             all_devices = list_devices()
             print(f"🔍 Available devices: {all_devices}")
             
-            # Update world_size based on available devices
             optimal_world_size = len(all_devices)
             if optimal_world_size != self.world_size:
                 print(f"🔄 Updating world_size from {self.world_size} to {optimal_world_size}")
                 self.world_size = optimal_world_size
             
-            # Update device_ids to use best available devices
             optimal_devices = get_best_devices(self.world_size)
             if optimal_devices != self.device_ids:
                 print(f"🔄 Updating device_ids from {self.device_ids} to {optimal_devices}")
@@ -781,13 +760,13 @@ class TensorParallelKeras(keras.Model):
         return {
             'world_size': self.world_size,
             'device_ids': self.device_ids,
-            'sharding_strategy': 'auto',  # Always auto - the smartest choice!
+            'sharding_strategy': 'auto',
             'distributed_backend': self.distributed_backend,
             'is_auto_detected': hasattr(self, '_auto_detected') and self._auto_detected,
-            'is_true_tensor_parallel': True,  # We now implement true tensor parallelism
-            'data_replication': True,  # Input data is replicated across devices
-            'no_output_gathering': True,  # Each shard keeps partial outputs
-            'local_gradients': True  # Gradients computed locally on partial outputs
+            'is_true_tensor_parallel': True,
+            'data_replication': True,
+            'no_output_gathering': True,
+            'local_gradients': True
         }
     
     def get_tensor_parallelism_info(self):
@@ -804,16 +783,16 @@ class TensorParallelKeras(keras.Model):
         """
         return {
             'implementation_type': 'TRUE_TENSOR_PARALLELISM',
-            'data_distribution': 'REPLICATED',  # Not sharded
+            'data_distribution': 'REPLICATED',
             'parameter_distribution': 'SHARDED',
-            'output_handling': 'PARTIAL_PER_SHARD',  # No gathering
+            'output_handling': 'PARTIAL_PER_SHARD',
             'gradient_computation': 'LOCAL_ON_PARTIAL_OUTPUTS',
             'gradient_synchronization': 'NONE_REQUIRED',
             'optimizer_state_sharding': 'ENABLED',
             'communication_pattern': 'INPUT_REPLICATION_ONLY',
-            'batch_size_scaling': 'NO_SCALING',  # Each device gets full batch
-            'memory_efficiency': 'HIGH',  # No duplicate parameter storage
-            'training_efficiency': 'HIGH'  # No all-reduce overhead
+            'batch_size_scaling': 'NO_SCALING',
+            'memory_efficiency': 'HIGH',
+            'training_efficiency': 'HIGH'
         }
     
     def validate_tensor_parallelism_setup(self):
@@ -831,7 +810,6 @@ class TensorParallelKeras(keras.Model):
         }
         
         try:
-            # Check 1: Model shards exist
             if hasattr(self, 'model_shards') and len(self.model_shards) > 0:
                 validation_results['checks']['model_shards'] = {
                     'status': 'PASSED',
@@ -845,7 +823,6 @@ class TensorParallelKeras(keras.Model):
                 validation_results['overall_status'] = 'FAILED'
                 validation_results['errors'].append('No model shards found')
             
-            # Check 2: Parameter sharding is working
             if hasattr(self, 'modified_parameters_names') and len(self.modified_parameters_names) > 0:
                 validation_results['checks']['parameter_sharding'] = {
                     'status': 'PASSED',
@@ -858,7 +835,6 @@ class TensorParallelKeras(keras.Model):
                 }
                 validation_results['warnings'].append('Parameter sharding may not be working')
             
-            # Check 3: Distributed backend is available
             if hasattr(self, 'distributed_backend') and self.distributed_backend is not None:
                 validation_results['checks']['distributed_backend'] = {
                     'status': 'PASSED',
@@ -871,7 +847,6 @@ class TensorParallelKeras(keras.Model):
                 }
                 validation_results['warnings'].append('No distributed backend available')
             
-            # Check 4: Optimizer setup
             if hasattr(self, 'coordinated_optimizer') and self.coordinated_optimizer is not None:
                 validation_results['checks']['optimizer_setup'] = {
                     'status': 'PASSED',
@@ -884,7 +859,6 @@ class TensorParallelKeras(keras.Model):
                 }
                 validation_results['warnings'].append('No coordinated optimizer found')
             
-            # Check 5: World size configuration
             if hasattr(self, 'world_size') and self.world_size > 1:
                 validation_results['checks']['world_size'] = {
                     'status': 'PASSED',
@@ -933,7 +907,7 @@ class TensorParallelKeras(keras.Model):
                 'optimizer_type': self._get_optimizer_type()
             },
             'training_features': {
-                'real_gradients': True,  # We now compute real gradients
+                'real_gradients': True,
                 'partial_outputs': True,
                 'local_updates': True,
                 'no_communication': True
@@ -962,24 +936,19 @@ class TensorParallelKeras(keras.Model):
         accepting and forwarding all Keras-compatible arguments.
         """
         if not hasattr(self, "original_model"):
-            # Fallback if the original model isn't available
             return super().train_on_batch(x, y, sample_weight, class_weight, **kwargs)
 
-        # Combine all provided arguments, including standard ones and kwargs
         call_kwargs = kwargs
         if sample_weight is not None:
             call_kwargs['sample_weight'] = sample_weight
         if class_weight is not None:
             call_kwargs['class_weight'] = class_weight
 
-        # Delegate the training call to the underlying original model
         result = self.original_model.train_on_batch(x, y, **call_kwargs)
 
-        # After training, re-shard the updated weights to keep all shards in sync
         try:
             self.set_weights(self.original_model.get_weights())
         except Exception as e:
-            # It's better to log the full exception for debugging
             import logging
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to reshard after train_on_batch: {e}", exc_info=True)

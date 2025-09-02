@@ -14,6 +14,8 @@ from .parameter_sharding import make_parameter_sharded_model
 from .sharding_keras import ShardedKeras
 from .coordinated_optimizer import TensorParallelOptimizer
 from .distribution_lib import get_best_devices
+from .communications_keras import AllReduceKeras, AllGatherKeras 
+
 
 logger = logging.getLogger(__file__)
 
@@ -31,7 +33,6 @@ class TensorParallelKeras(keras.Model):
         if self.world_size <= 1:
             self.distributed = False
             self.model_shards = [self.original_model]
-            self.sharded_models = [self.original_model]
             return
 
         self.distributed = True
@@ -41,7 +42,6 @@ class TensorParallelKeras(keras.Model):
         config_with_ops = self.tensor_parallel_config.create_collective_ops(self.devices, self.distributed)
         
         self.model_shards = []
-        self.sharded_models = []
         
         print(f"🔧 Creating model shards for {model.name}")
         for rank in range(self.world_size):
@@ -49,7 +49,6 @@ class TensorParallelKeras(keras.Model):
                 model, config_with_ops, rank=rank, world_size=self.world_size
             )
             self.model_shards.append(shard_wrapper)
-            self.sharded_models.append(shard_wrapper.original_model)
 
     def build_assembled_model(self):
         """
@@ -60,7 +59,7 @@ class TensorParallelKeras(keras.Model):
             return self.original_model
 
         input_layer = self.original_model.inputs[0]
-        partial_outputs = [model(input_layer) for model in self.sharded_models]
+        partial_outputs = [model(input_layer) for model in self.model_shards]
         final_layer = self.original_model.layers[-1]
         sharding_type = "unknown"
         final_kernel_name = f"{final_layer.name}.kernel"
@@ -74,7 +73,7 @@ class TensorParallelKeras(keras.Model):
                 break
 
         if sharding_type == "column":
-            final_output = ops.concatenate(partial_outputs, axis=-1)
+            final_output = keras.ops.concatenate(partial_outputs, axis=-1)
             original_output_dim = self.original_model.output_shape[-1]
             if final_output.shape[-1] != original_output_dim:
                 final_output = keras.layers.Lambda(
@@ -113,21 +112,15 @@ class TensorParallelKeras(keras.Model):
         if self.distributed:
             config_with_ops = self.tensor_parallel_config.create_collective_ops(self.devices, self.distributed)
             self.model_shards = []
-            self.sharded_models = [] 
             for rank, device_id in enumerate(self.devices):
                 shard_wrapper, _ = make_parameter_sharded_model(
                     self.original_model, config_with_ops, rank=rank, world_size=self.world_size
                 )
                 self.model_shards.append(shard_wrapper)
-                self.sharded_models.append(shard_wrapper.original_model)
         else:
             self.model_shards = [self.original_model]
-            self.sharded_models = [self.original_model]
 
         print("✅ Re-sharding complete. All shards are synchronized.")
-
-        print("✅ Re-sharding complete. All shards are synchronized.")
-
 
     def _get_unpacked_weights(self, weight_collection_name):
         """
@@ -137,6 +130,7 @@ class TensorParallelKeras(keras.Model):
             return []
 
         all_weights = []
+        for model in self.model_shards:
         for model in self.model_shards:
             weight_collection = getattr(model, weight_collection_name)
             all_weights.extend(weight_collection)
@@ -312,16 +306,18 @@ class TensorParallelKeras(keras.Model):
             0  
         )
 
-
     def call(self, inputs, training=None, **kwargs):
         """
-        Orchestrates the forward pass. This final version correctly handles replicated
-        outputs from complex models with internal sharding (like KerasNLP backbones).
+        Orchestrates the forward pass. This robust version handles different
+        final layer types and correctly matches sharding rules.
         """
         if not self.distributed:
             return self.original_model(inputs, training=training, **kwargs)
 
         partial_outputs = [model(inputs, training=training, **kwargs) for model in self.model_shards]
+        # FIX: Use self.model_shards, which contains the correct sharded wrappers.
+        partial_outputs = [model(inputs, training=training, **kwargs) for model in self.model_shards]
+
         if not partial_outputs:
             logger.warning("No shard outputs found, returning None.")
             return None
@@ -332,9 +328,13 @@ class TensorParallelKeras(keras.Model):
         else:
             final_layer = self.original_model.layers[-1]
             sharding_type = "unknown"
+            
+            # ✅ Improved pattern matching to be more robust
             final_kernel_name = f"{final_layer.name}.kernel"
             for pattern, action in self.tensor_parallel_config.state_rules.items():
-                if re.match(pattern, final_kernel_name):
+                # Use re.search and a cleaned pattern for more reliable matching
+                clean_pattern = pattern.strip('^$')
+                if re.search(clean_pattern, final_kernel_name):
                     if hasattr(action, 'sharding_type'):
                         sharding_type = action.sharding_type
                     break
@@ -343,17 +343,20 @@ class TensorParallelKeras(keras.Model):
                 final_output = keras.ops.concatenate(partial_outputs, axis=-1)
                 if isinstance(self.original_model.output_shape, (list, tuple)):
                      original_output_dim = self.original_model.output_shape[-1]
-                     if final_output.shape[-1] != original_output_dim:
+                     if final_output.shape[-1] > original_output_dim:
                          final_output = final_output[..., :original_output_dim]
                 return final_output
 
             elif sharding_type == "row":
                 final_output = keras.ops.sum(keras.ops.stack(partial_outputs), axis=0)
-                if final_layer.use_bias:
+                
+                # ✅ This is the main fix: Use hasattr to prevent AttributeError
+                if hasattr(final_layer, 'use_bias') and final_layer.use_bias and hasattr(final_layer, 'bias'):
                     bias = final_layer.bias
-                    bias_shape = [1] * (len(final_output.shape) - 1) + [-1]
-                    reshaped_bias = keras.ops.reshape(bias, bias_shape)
-                    final_output -= reshaped_bias * (self.world_size - 1)
+                    if bias is not None:
+                        bias_shape = [1] * (len(final_output.shape) - 1) + [-1]
+                        reshaped_bias = keras.ops.reshape(bias, bias_shape)
+                        final_output -= reshaped_bias * (self.world_size - 1)
                 return final_output
 
             else:
@@ -515,8 +518,7 @@ class TensorParallelKeras(keras.Model):
         else:
             super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
 
-    def train_step(self, x, y, sample_weight=None):
-        import tensorflow as tf
+    def train_step(self, *args):
         """
         A robust, numerically correct training step for tensor parallelism.
         This signature accepts unpacked data (x, y, sample_weight) to be directly
@@ -552,12 +554,38 @@ class TensorParallelKeras(keras.Model):
         gradients = tape.gradient(loss, trainable_vars)
         self.optimizer.apply(gradients, trainable_vars)
 
+        A robust, backend-agnostic training step for Keras 3.
+        This version handles different backend call signatures for `train_step`
+        by accepting a variable number of arguments.
+        """
+        # Keras backends might pass data as a single packed tuple or as
+        # unpacked x, y, sample_weight arguments.
+        # We pass the received arguments to the robust `unpack_x_y_sample_weight`
+        # utility which can handle both cases.
+        x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(args)
+
+        # The custom `call` method handles the distributed forward pass.
+        # The `compute_loss` method is inherited from `keras.Model` and is backend-agnostic.
+        y_pred = self(x, training=True)
+        loss = self.compute_loss(
+            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight
+        )
+
+        # `keras.backend.compute_gradients` is the correct backend-agnostic way
+        # to get gradients.
+        gradients = keras.backend.compute_gradients(loss, self.trainable_variables)
+
+        # `self.optimizer` is the (potentially wrapped) optimizer from `compile()`.
+        # Its `apply` method will trigger our `TensorParallelOptimizer` logic for synchronization.
+        self.optimizer.apply(gradients, self.trainable_variables)
+
+        # Update metrics. `self.metrics` are the metrics from `compile()`.
         for metric in self.metrics:
             if metric.name == "loss":
                 metric.update_state(loss)
             else:
-                metric.update_state(y, y_pred, sample_weight)
-        
+                metric.update_state(y, y_pred, sample_weight=sample_weight)
+
         return {m.name: m.result() for m in self.metrics}
 
     def _synchronize_gradients_for_backward_pass(self, sharded_grads):
@@ -954,3 +982,4 @@ class TensorParallelKeras(keras.Model):
             logger.warning(f"Failed to reshard after train_on_batch: {e}", exc_info=True)
             
         return result
+

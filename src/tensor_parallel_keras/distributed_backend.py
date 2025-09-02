@@ -7,7 +7,8 @@ Centralizes all backend-specific operations for JAX, TensorFlow, and PyTorch
 import logging
 from typing import List, Any
 import numpy as np
-import keras 
+import keras
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,7 @@ class DistributedBackend:
                     return "pytorch"
                 except ImportError:
                     return "numpy"
-
-        
+    
     def _detect_backend(self) -> str:
         """Detect the available backend."""
         try:
@@ -346,37 +346,150 @@ class DistributedBackend:
         """Get JAX communication operations."""
         import jax
         import jax.lax as lax
+        import jax.numpy as jnp
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        def all_reduce_jax(x, op="sum", axis_name="data"):
+            return lax.pmean(x, axis_name=axis_name)
+
+        def all_gather_jax(x, axis=0, axis_name="model"):
+            return lax.all_gather(x, axis_name=axis_name, axis=axis)
+
+        def broadcast_jax(x, axis_name="data"):
+            return lax.all_gather(x, axis_name=axis_name, axis=0)
+
+        def scatter_jax(x, num_devices, axis_name="data"):
+            return lax.psplit(x, axis_name=axis_name, num_splits=num_devices)
+
+        def all_reduce_simulated(x, op="sum", axis_name="data"):
+            return jnp.sum(x, axis=0)
         
-        return {
-            "all_reduce": lambda x, op="sum": lax.pmean(x, axis_name="batch"),
-            "all_gather": lambda x: lax.all_gather(x, axis_name="batch"),
-            "broadcast": lambda x: x,
-            "scatter": lambda x, num_devices: lax.psplit(x, axis_name="batch", num_splits=num_devices)
-        }
+        def all_gather_simulated(x, axis=0, axis_name="model"):
+            return jnp.concatenate([x, x], axis=axis)
+
+        def broadcast_simulated(x):
+            return x
+
+        def scatter_simulated(x, num_devices):
+            return jnp.split(x, num_devices, axis=0)
+        
+        try:
+            if jax.device_count() > 1:
+                logger.info("Using real JAX collective communication ops.")
+                return {
+                    "all_reduce": all_reduce_jax,
+                    "all_gather": all_gather_jax,
+                    "broadcast": broadcast_jax,
+                    "scatter": scatter_jax
+                }
+            else:
+                raise RuntimeError("Not running on multiple JAX devices.")
+        
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"JAX collective ops not available or multiple devices not configured: {e}. Using SIMULATED ops.")
+            return {
+                "all_reduce": all_reduce_simulated,
+                "all_gather": all_gather_simulated,
+                "broadcast": broadcast_simulated,
+                "scatter": scatter_simulated
+            }
     
     def _get_tensorflow_communication_ops(self):
         """Get TensorFlow communication operations."""
         import tensorflow as tf
         
-        return {
-            "all_reduce": lambda x, op="sum": tf.reduce_sum(x, axis=0),
-            "all_gather": lambda x: tf.concat([x, x], axis=0),
-            "broadcast": lambda x: x,
-            "scatter": lambda x, num_devices: tf.split(x, num_devices, axis=0)
-        }
-    
-    def _pytorch_all_gather_wrapper(self, tensor, axis=-1):
-        """Wrapper for torch.distributed.all_gather to provide a friendlier API."""
-        import torch
-        import torch.distributed as dist
-        world_size = dist.get_world_size()
-        tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
-        dist.all_gather(tensor_list, tensor)
-        return torch.cat(tensor_list, dim=axis)
+        def all_reduce_tf(x, op="sum"):
+            strategy = tf.distribute.get_strategy()
+            return strategy.reduce(tf.distribute.ReduceOp.SUM, x, axis=0)
+
+        def all_gather_tf(x, axis=0):
+            strategy = tf.distribute.get_strategy()
+            return tf.raw_ops.AllGather(
+                input=x, 
+                group_assignment=[[i for i in range(strategy.num_replicas_in_sync)]], 
+                group_size=strategy.num_replicas_in_sync
+            )
+
+        def broadcast_tf(x, root=0):
+            strategy = tf.distribute.get_strategy()
+            return strategy.broadcast(x)
+
+        def scatter_tf(x):
+            strategy = tf.distribute.get_strategy()
+            return strategy.scatter(x, axis=0)
+        
+        def all_reduce_simulated(x, op="sum"):
+            return keras.ops.sum(x, axis=0)
+        
+        def all_gather_simulated(x, axis=0):
+            return keras.ops.concatenate([x, x], axis=axis)
+        
+        def broadcast_simulated(x):
+            return x
+        
+        def scatter_simulated(x, num_devices):
+            return keras.ops.split(x, num_devices, axis=0)
+
+        try:
+            strategy = tf.distribute.get_strategy()
+            if not isinstance(strategy, (tf.distribute.MirroredStrategy, tf.distribute.MultiWorkerMirroredStrategy)):
+                raise RuntimeError("No active `tf.distribute` strategy found. Cannot use real collectives.")
+
+            logger.info("Using real TensorFlow `tf.distribute` collective ops.")
+            return {
+                "all_reduce": all_reduce_tf,
+                "all_gather": all_gather_tf,
+                "broadcast": broadcast_tf,
+                "scatter": scatter_tf
+            }
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"TensorFlow collective ops not available: {e}. Using SIMULATED ops.")
+            return {
+                "all_reduce": all_reduce_simulated,
+                "all_gather": all_gather_simulated,
+                "broadcast": broadcast_simulated,
+                "scatter": scatter_simulated
+            }
     
     def _get_pytorch_communication_ops(self):
         """Get PyTorch communication operations using torch.distributed."""
         import torch
+        
+        def all_reduce_torch(tensor, op="sum"):
+            if op == "sum":
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            elif op == "mean":
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                tensor /= dist.get_world_size()
+            return tensor
+
+        def all_gather_torch(tensor, axis=-1):
+            world_size = dist.get_world_size()
+            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
+            dist.all_gather(tensor_list, tensor)
+            return torch.cat(tensor_list, dim=axis)
+
+        def broadcast_torch(x, root=0):
+            dist.broadcast(x, src=root)
+            return x
+
+        def scatter_torch(x):
+            return x
+
+        def all_reduce_simulated(x, op="sum"):
+            return keras.ops.sum(keras.ops.stack(x), axis=0)
+
+        def all_gather_simulated(x, axis=0):
+            return keras.ops.concatenate(x, axis=axis)
+        
+        def broadcast_simulated(x):
+            return x
+        
+        def scatter_simulated(x, num_devices):
+            return keras.ops.split(x, num_devices, axis=0)
+
         try:
             import torch.distributed as dist
             if dist.is_available() and dist.is_initialized():
@@ -397,11 +510,25 @@ class DistributedBackend:
     
     def _get_numpy_communication_ops(self):
         """Get NumPy communication operations (simplified)."""
+        logger.info("Using SIMULATED NumPy communication ops.")
+
+        def all_reduce_np(x, op="sum"):
+            return keras.ops.sum(x, axis=0)
+        
+        def all_gather_np(x, axis=0):
+            return keras.ops.concatenate([x, x], axis=axis)
+        
+        def broadcast_np(x):
+            return x
+        
+        def scatter_np(x, num_devices):
+            return keras.ops.split(x, num_devices, axis=0)
+
         return {
-            "all_reduce": lambda x, op="sum": np.sum(x, axis=0),
-            "all_gather": lambda x: np.concatenate([x, x], axis=0),
-            "broadcast": lambda x: x,
-            "scatter": lambda x, num_devices: np.split(x, num_devices, axis=0)
+            "all_reduce": all_reduce_np,
+            "all_gather": all_gather_np,
+            "broadcast": broadcast_np,
+            "scatter": scatter_np
         }
 
 def get_distributed_backend(backend_name: str = 'auto', world_size: int = 1, rank: int = 0):
@@ -432,7 +559,7 @@ def get_distributed_backend(backend_name: str = 'auto', world_size: int = 1, ran
     else:
         return DistributedBackend(backend_name)
 
-def allreduce_gradients(gradients: List[np.ndarray], backend: DistributedBackend, op: str = 'mean') -> List[np.ndarray]:
+def allreduce_gradients(gradients: List[Any], backend: DistributedBackend, op: str = 'mean') -> List[Any]:
     """AllReduce a list of gradients."""
     synchronized = []
     for grad in gradients:
@@ -443,7 +570,7 @@ def allreduce_gradients(gradients: List[np.ndarray], backend: DistributedBackend
             synchronized.append(None)
     return synchronized
 
-def allgather_outputs(outputs: List[np.ndarray], backend: DistributedBackend, axis: int = 0) -> np.ndarray:
+def allgather_outputs(outputs: List[Any], backend: DistributedBackend, axis: int = 0) -> Any:
     """AllGather outputs from all shards."""
     if len(outputs) == 1:
         return outputs[0]
@@ -454,7 +581,7 @@ def allgather_outputs(outputs: List[np.ndarray], backend: DistributedBackend, ax
             
     raise ValueError("No valid outputs to gather")
 
-def broadcast_parameters(parameters: List[np.ndarray], backend: DistributedBackend, root: int = 0) -> List[np.ndarray]:
+def broadcast_parameters(parameters: List[Any], backend: DistributedBackend, root: int = 0) -> List[Any]:
     """Broadcast parameters from root to all processes."""
     broadcasted = []
     for param in parameters:
@@ -463,4 +590,4 @@ def broadcast_parameters(parameters: List[np.ndarray], backend: DistributedBacke
             broadcasted.append(broadcasted_param)
         else:
             broadcasted.append(None)
-    return broadcasted 
+    return broadcasted

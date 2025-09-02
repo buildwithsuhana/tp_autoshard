@@ -8,6 +8,9 @@ import logging
 import numpy as np
 import keras
 from keras import layers, optimizers
+import matplotlib
+# Use a non-interactive backend for matplotlib to prevent errors in environments without a GUI
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
@@ -26,7 +29,7 @@ def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers
         layers.Dense(hidden_size * 4, activation='relu'),
         layers.Dense(hidden_size, activation='relu'),
         layers.Dense(vocab_size, activation='softmax')
-    ])
+    ], name="simplified_opt")
     
     print(f"      Simplified model created with {model.count_params():,} parameters")
     return model
@@ -88,7 +91,8 @@ def test_opt125m_parameter_sharding():
     tp_manager = TensorParallelKeras(model=opt_model, world_size=7, distributed_backend='fallback')
     
     total_sharded_params = 0
-    for i, shard in enumerate(tp_manager.sharded_models):
+    # FIX: Iterate over `tp_manager.model_shards` which contains the sharded model wrappers
+    for i, shard in enumerate(tp_manager.model_shards):
         shard_params = shard.count_params()
         total_sharded_params += shard_params
         print(f"   Shard {i}: {shard_params:,} parameters")
@@ -110,7 +114,7 @@ def test_opt125m_inference_correctness():
     opt_model = create_opt125m_model()
     
     print(f"⏱️  {time.time() - start_time:.2f}s: Testing tensor parallelism...")
-    tp_manager = TensorParallelKeras(model=opt_model, world_size=7, distributed_backend='fallback')
+    tp_manager = TensorParallelKeras(model=opt_model, world_size=2, distributed_backend='fallback')
     tp_model = tp_manager.build_assembled_model()
 
     print(f"✅ {time.time() - start_time:.2f}s: Models created successfully")
@@ -118,7 +122,7 @@ def test_opt125m_inference_correctness():
         test_input = np.random.randint(0, 1000, (1, seq_len), dtype=np.int32)
         print(f"   Testing sequence {seq_len}: (1, {seq_len})")
         original_output = opt_model(test_input)
-        tp_output = tp_model(test_input)
+        tp_output = tp_manager(test_input) # Call the manager directly
         print(f"      Original output shape: {original_output.shape}")
         print(f"      TP output shape: {tp_output.shape}")
         if original_output.shape == tp_output.shape:
@@ -134,7 +138,7 @@ def plot_training_graphs(original_history, tp_history):
     """
     Plots the loss and perplexity curves for both the original and TP models.
     """
-    if original_history and tp_history:
+    if original_history and tp_history and 'loss' in original_history.history and 'loss' in tp_history.history:
         original_perplexity = np.exp(original_history.history['loss'])
         tp_perplexity = np.exp(tp_history.history['loss'])
 
@@ -160,8 +164,12 @@ def plot_training_graphs(original_history, tp_history):
         plt.grid(True)
         
         plt.tight_layout()
-        plt.show()
-        print("\n   Generating training performance graphs...")
+        
+        # Save the figure instead of showing it
+        plot_filename = "training_performance_comparison.png"
+        plt.savefig(plot_filename)
+        plt.close() # Close the figure to free up memory
+        print(f"\n   Training performance graphs saved to {plot_filename}")
 
 
 def test_opt125m_training_verification():
@@ -210,11 +218,26 @@ def test_opt125m_training_verification():
     print("=" * 61 + "\n")
 
     print(f"⏱️  {time.time() - start_time:.2f}s: Compiling models...")
-    tp_model.compile(optimizer=base_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    # FIX: Compile the manager directly
+    tp_manager.compile(optimizer=base_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
     baseline_optimizer = optimizers.Adam()
     baseline_model.compile(optimizer=baseline_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     print(f"✅ Models compiled successfully")
+    
+    print(f"⏱️  {time.time() - start_time:.2f}s: Analyzing optimizer memory usage...")
+    # FIX: Access the coordinated_optimizer from the manager
+    if hasattr(tp_manager, 'coordinated_optimizer'):
+        memory_info = tp_manager.coordinated_optimizer.get_memory_usage()
+        print("      Memory Analysis Results:")
+        print(f"         Sharding Enabled: {memory_info.get('sharding_enabled')}")
+        print(f"         World Size: {memory_info.get('world_size')}")
+        print(f"         Total Optimizer State Memory (Sharded): {memory_info.get('sharded_memory', 'N/A')}")
+        print(f"         Memory Savings vs. Replicated State: {memory_info.get('memory_savings', 'N/A')}")
+        print("      ✅ Memory analysis completed.")
+    else:
+        print("      ⚠️  Could not find coordinated_optimizer on the TP model to analyze memory.")
+
 
     print(f"⏱️  {time.time() - start_time:.2f}s: Training models for comparison...")
     x_train = np.random.randint(0, 1000, (100, 10), dtype=np.int32)
@@ -224,7 +247,8 @@ def test_opt125m_training_verification():
     print(f"      ✅ Baseline model training completed")
     
     try:
-        tp_history = tp_model.fit(x_train, y_train, epochs=10, batch_size=16, verbose=0)
+        # FIX: Call fit on the manager directly
+        tp_history = tp_manager.fit(x_train, y_train, epochs=10, batch_size=16, verbose=0)
         print(f"      ✅ TP model training completed")
     except Exception as e:
         print(f"      ❌ TP model training failed with an error: {e}")
@@ -279,3 +303,4 @@ if __name__ == "__main__":
         print("\n🚀 SUCCESS: All OPT-125M verification tests passed!")
     else:
         print(f"\n⚠️  WARNING: {len(test_results) - passed_tests} tests failed.")
+

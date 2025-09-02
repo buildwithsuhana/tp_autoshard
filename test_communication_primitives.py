@@ -5,8 +5,10 @@ Test communication primitives with the conjugate rule for true tensor parallelis
 
 import numpy as np
 import keras
-# Import keras.ops for backend-agnostic tensor operations
 import keras.ops
+
+# ✅ 1. Import the DistributedBackend
+from src.tensor_parallel_keras.distributed_backend import DistributedBackend
 from src.tensor_parallel_keras.communications_keras import (
     TensorParallelCommunicator,
     AllGatherKeras,
@@ -20,10 +22,16 @@ def test_communication_primitives():
     
     world_size = 2
     
+    # ✅ 2. Create a backend instance based on the active Keras backend
+    active_backend_name = keras.backend.backend()
+    print(f"🔧 Initializing backend for the test: '{active_backend_name}'")
+    backend = DistributedBackend(active_backend_name)
+    
     # Test 1: AllGather operation
     print("\n🔍 Test 1: AllGather Operation")
     print("-" * 30)
-    allgather = AllGatherKeras(world_size, dim=-1)
+    # ✅ 3. Pass the backend to the constructor
+    allgather = AllGatherKeras(world_size, backend=backend, dim=-1)
     tensor1 = keras.ops.array([[1.0, 2.0], [3.0, 4.0]], dtype="float32")
     tensor2 = keras.ops.array([[5.0, 6.0], [7.0, 8.0]], dtype="float32")
     tensors = [tensor1, tensor2]
@@ -35,7 +43,6 @@ def test_communication_primitives():
     result = allgather(tensors)
     print(f"   AllGather result: {result.shape} = {result.tolist()}")
     
-    # Verify result using keras.ops and numpy
     expected = keras.ops.array([[1, 2, 5, 6], [3, 4, 7, 8]], dtype="float32")
     if np.allclose(keras.ops.convert_to_numpy(result), keras.ops.convert_to_numpy(expected)):
         print("   ✅ AllGather test PASSED")
@@ -47,9 +54,9 @@ def test_communication_primitives():
     # Test 2: AllReduce operation
     print("\n🔍 Test 2: AllReduce Operation")
     print("-" * 30)
-    allreduce = AllReduceKeras(world_size, op="sum")
+    # ✅ 4. Pass the backend to the constructor
+    allreduce = AllReduceKeras(world_size, backend=backend, op="sum")
     
-    # Use keras.ops.array instead of torch.tensor
     tensor1 = keras.ops.array([[1, 2], [3, 4]], dtype="float32")
     tensor2 = keras.ops.array([[5, 6], [7, 8]], dtype="float32")
     tensors = [tensor1, tensor2]
@@ -63,7 +70,6 @@ def test_communication_primitives():
     for i, r in enumerate(results):
         print(f"   - Shard {i}: {r.shape} = {r.tolist()}")
     
-    # Verify results using keras.ops and numpy
     expected_sum = tensor1 + tensor2
     if all(np.allclose(keras.ops.convert_to_numpy(r), keras.ops.convert_to_numpy(expected_sum)) for r in results):
         print("   ✅ AllReduce test PASSED")
@@ -74,9 +80,9 @@ def test_communication_primitives():
     # Test 3: Conjugate Rule Verification
     print("\n🔍 Test 3: Conjugate Rule Verification")
     print("-" * 30)
+    # This class correctly creates its own backend, so no change is needed here.
     communicator = TensorParallelCommunicator(world_size, rank=0)
     
-    # Use consistent keras.ops tensors
     tensors = [
         keras.ops.array([[1, 2], [3, 4]], dtype="float32"),
         keras.ops.array([[5, 6], [7, 8]], dtype="float32")
@@ -86,7 +92,6 @@ def test_communication_primitives():
     forward_output = communicator.forward_column_parallel(tensors, dim=-1)
     print(f"   - Forward output: {forward_output.shape}")
     
-    # Use keras.ops.ones_like for gradients
     gradients = [keras.ops.ones_like(t) for t in tensors]
     backward_gradients = communicator.backward_column_parallel(gradients, op="sum")
     print(f"   - Backward gradients: {len(backward_gradients)} tensors")
@@ -99,22 +104,12 @@ def test_communication_primitives():
     print(f"   - Backward gradient: {backward_gradient.shape}")
     
     print("   ✅ Conjugate rule verification PASSED")
-    
-    # Test 4: MLP Handshake
-# In test_communication_primitives.py
 
     # Test 4: MLP Handshake
     print("\n🔍 Test 4: MLP Handshake Optimization")
     print("-" * 30)
-
-    # CORRECTED: The function is keras.ops.normal, not keras.ops.random.normal
     up_outputs = [keras.random.normal((2, 4)) for _ in range(world_size)]
-    down_inputs = [keras.random.normal((2, 4)) for _ in range(world_size)]
-
     print(f"   Up projection outputs: {len(up_outputs)} tensors of shape {up_outputs[0].shape}")
-
-    # Handshake doesn't exist in the communicator, assuming this is conceptual
-    # If the method exists, it should work with keras.ops tensors
     print("   ✅ MLP handshake test PASSED (conceptual)")
     return True
 

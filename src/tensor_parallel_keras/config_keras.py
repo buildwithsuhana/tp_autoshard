@@ -2,6 +2,8 @@ import dataclasses
 from typing import Any, Dict, Sequence
 
 from .communications_keras import AllReduceKeras, AllGatherKeras, BroadcastKeras
+from .distributed_backend import get_distributed_backend
+
 
 @dataclasses.dataclass
 class ConfigKeras:
@@ -10,9 +12,13 @@ class ConfigKeras:
     
     def create_collective_ops(self, devices: Sequence[str], distributed: bool = True):
         world_size = len(devices)
-        make_allreduce = lambda ws: AllReduceKeras(ws, op="mean")
-        make_allgather = lambda ws, dim: AllGatherKeras(ws, dim)
-        make_broadcast = lambda ws: BroadcastKeras(ws)
+        backend = get_distributed_backend()
+        
+        # Pass the backend instance to the constructors
+        make_allreduce = lambda ws: AllReduceKeras(ws, backend=backend, op="mean")
+        make_allgather = lambda ws, dim: AllGatherKeras(ws, backend=backend, dim=dim)
+        make_broadcast = lambda ws: BroadcastKeras(ws, backend=backend)
+
             
         def create_collective_ops(rules: Dict[str, Any]) -> Dict[str, Any]:
             result = {}

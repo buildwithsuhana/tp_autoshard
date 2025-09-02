@@ -1,29 +1,15 @@
-"""
-Configuration classes for Keras Tensor Parallel
-"""
-
 import dataclasses
-from typing import Any, Callable, Dict, Optional, Sequence, Union
-
-from keras import layers
+from typing import Any, Dict, Sequence
 
 from .communications_keras import AllReduceKeras, AllGatherKeras, BroadcastKeras
 
-
 @dataclasses.dataclass
 class ConfigKeras:
-    """
-    Configuration for Keras tensor parallel operations.
-    """
     state_rules: Dict[str, Any]
     output_rules: Dict[str, Any]
     
     def create_collective_ops(self, devices: Sequence[str], distributed: bool = True):
-        """
-        Create collective operations for the configuration.
-        """
         world_size = len(devices)
-        
         make_allreduce = lambda ws: AllReduceKeras(ws, op="mean")
         make_allgather = lambda ws, dim: AllGatherKeras(ws, dim)
         make_broadcast = lambda ws: BroadcastKeras(ws)

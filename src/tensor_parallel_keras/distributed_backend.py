@@ -5,7 +5,7 @@ Centralizes all backend-specific operations for JAX, TensorFlow, and PyTorch
 """
 
 import logging
-from typing import List, Any, Union, Tuple, Optional
+from typing import List, Any
 import numpy as np
 import keras 
 
@@ -21,10 +21,7 @@ class DistributedBackend:
     def _initialize_backend(self) -> str:
         """Initializes the backend, respecting the user's choice."""
         if self.backend_name != "auto":
-            # If a specific backend is requested, use it.
             return self.backend_name
-
-        # --- This is the old _detect_backend logic, now used only for "auto" ---
         try:
             import jax
             return "jax"
@@ -86,7 +83,6 @@ class DistributedBackend:
                 return tf.convert_to_tensor(tensor)
         elif self.backend == "pytorch":
             import torch
-            # Use the native clone() method; detach() removes it from the grad graph
             return tensor.clone().detach()
         else:
             return keras.ops.convert_to_numpy(tensor)
@@ -156,13 +152,7 @@ class DistributedBackend:
             return [tf.zeros_like(var) for var in trainable_vars]
     
     def _compute_pytorch_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
-        """
-        Computes gradients for PyTorch.
-        NOTE: In a Keras model, this is handled by `loss.backward()` in the `train_step`.
-        This function is deprecated for the Keras workflow.
-        """
         logger.warning("PyTorch gradient computation is handled by `loss.backward()` in the Keras model's `train_step`.")
-        # The actual logic `loss.backward()` is stateful and doesn't fit this functional pattern.
         return self._create_zero_gradients(trainable_vars)
     
     def _create_zero_gradients(self, trainable_vars: List[Any]) -> List[Any]:
@@ -190,17 +180,6 @@ class DistributedBackend:
                 gradients.append(0.0)
         
         return gradients
-    
-    # def _create_zero_gradients(self, trainable_vars: List[Any]) -> List[Any]:
-    #     """Create zero gradients as fallback."""
-    #     gradients = []
-    #     for var in trainable_vars:
-    #         if hasattr(var, 'shape'):
-    #             zero_grad = np.zeros_like(var)
-    #             gradients.append(zero_grad)
-    #         else:
-    #             gradients.append(0.0)
-    #     return gradients
     
     def apply_gradients(self, gradients: List[Any], trainable_vars: List[Any], 
                        learning_rate: float = 0.001) -> None:
@@ -407,10 +386,10 @@ class DistributedBackend:
                     "all_gather": self._pytorch_all_gather_wrapper,
                 }
         except (ImportError, RuntimeError):
-            pass # Fallback to simulation
+            pass
         
         logger.warning("torch.distributed not available or initialized. Using SIMULATED communication ops.")
-        world_size = 1 # Cannot know world_size, assume 1
+        world_size = 1
         return {
             "all_reduce": lambda x, op="sum": x,
             "all_gather": lambda x, axis=-1: torch.cat([x] * world_size, dim=axis),

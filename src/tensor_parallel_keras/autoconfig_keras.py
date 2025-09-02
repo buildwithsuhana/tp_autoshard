@@ -1,7 +1,3 @@
-"""
-Automatic configuration for Keras Tensor Parallel
-"""
-
 import logging
 from typing import Sequence
 from keras import Model, layers
@@ -10,21 +6,7 @@ from .state_actions_keras import SplitKeras
 
 logger = logging.getLogger(__name__)
 
-
 def analyze_dense_layer_directly(layer: layers.Dense, module: Model, prefix: str) -> str:
-    """
-    Analyze a Dense layer directly to determine its MLP role.
-    No name lookups - pure structural analysis.
-    
-    Args:
-        layer: The Dense layer to analyze
-        module: The parent module containing the layer
-        prefix: Current layer name prefix for context
-        
-    Returns:
-        String indicating the layer type: 'up_projection', 'down_projection', or 'generic_dense'
-    """
-    
     if not isinstance(layer, layers.Dense):
         return 'generic_dense'
     
@@ -73,16 +55,6 @@ def analyze_dense_layer_directly(layer: layers.Dense, module: Model, prefix: str
 
 
 def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> ConfigKeras:
-    """
-    Get default configuration for Keras tensor parallel.
-    
-    Args:
-        module: Keras model to analyze
-        device_ids: List of device IDs for sharding
-        
-    Returns:
-        ConfigKeras object with sharding rules
-    """
     world_size = len(device_ids)
     state_rules = {}
     output_rules = {}
@@ -109,7 +81,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                         )
                     
                     output_rules[f"^{full_name}$"] = {0: "gather"}
-                    
                     logger.info(f"Applied Column-wise sharding to MLP up-projection {full_name} (direct-analysis)")
                 
                 elif mlp_type == 'down_projection':

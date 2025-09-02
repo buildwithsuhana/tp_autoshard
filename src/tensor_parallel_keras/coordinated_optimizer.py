@@ -24,14 +24,6 @@ class CoordinatedOptimizer:
         self.tensor_parallel_config = tensor_parallel_config
         self.sharded_states = {}
 
-        # FIX: Create optimizer clones using the correct Keras 3 API.
-        self.shard_optimizers = []
-        for _ in range(self.world_size):
-            # The correct way to clone an optimizer is to create a new one from its config.
-            config = self.base_optimizer.get_config()
-            self.shard_optimizers.append(self.base_optimizer.__class__.from_config(config))
-
-
         if get_distributed_backend:
             try:
                 self.distributed_backend = get_distributed_backend(distributed_backend, world_size, rank)
@@ -288,7 +280,6 @@ class CoordinatedOptimizer:
             updated_vars_count = 0
             for state_name, state_value in local_states.items():
                 if isinstance(state_value, dict):
-                if isinstance(state_value, dict):
                     for param_name, local_param_state in state_value.items():
                         key = (state_name, param_name)
                         if key in optimizer_var_map:
@@ -296,7 +287,6 @@ class CoordinatedOptimizer:
                             updated_vars_count += 1
                         else:
                             logger.warning(f"Could not find matching variable in optimizer for local state '{state_name}/{param_name}'.")
-                else:
                 else:
                     key = (state_name, None)
                     if key in optimizer_var_map:
@@ -323,12 +313,8 @@ class CoordinatedOptimizer:
         num_weights = len(gradients_and_vars[0])
         
         for i in range(num_weights):
-            # Check if variable exists for this grad before accessing
-            if i < len(gradients_and_vars[0]) and gradients_and_vars[0][i]:
-                variable = gradients_and_vars[0][i][1]
-            else:
-                continue
-
+            variable = gradients_and_vars[0][i][1]
+            
             needs_sync = False
             import re
             for pattern in column_parallel_patterns:
@@ -338,16 +324,14 @@ class CoordinatedOptimizer:
             
             if needs_sync:
                 grads_to_reduce = [gradients_and_vars[shard_idx][i][0] 
-                                   for shard_idx in range(self.world_size)
-                                   if i < len(gradients_and_vars[shard_idx]) and gradients_and_vars[shard_idx][i]]
+                                   for shard_idx in range(self.world_size)]
                 
                 if any(g is not None for g in grads_to_reduce):
                     synced_grad = self._allreduce_gradients(grads_to_reduce)
                 
                     for shard_idx in range(self.world_size):
-                        if i < len(gradients_and_vars[shard_idx]) and gradients_and_vars[shard_idx][i]:
-                            original_var = gradients_and_vars[shard_idx][i][1]
-                            gradients_and_vars[shard_idx][i] = (synced_grad, original_var)
+                        original_var = gradients_and_vars[shard_idx][i][1]
+                        gradients_and_vars[shard_idx][i] = (synced_grad[shard_idx], original_var)
 
         return gradients_and_vars
     
@@ -400,8 +384,22 @@ class CoordinatedOptimizer:
         try:
             def _bytes_for_var(var) -> int:
                 try:
-                    numel = int(np.prod(var.shape))
-                    itemsize = np.dtype(var.dtype).itemsize
+                    shape = getattr(var, 'shape', ())
+                    if hasattr(shape, 'as_list'):
+                        shape = tuple(d if d is not None else 0 for d in shape.as_list())
+                    else:
+                        shape = tuple(int(d) for d in shape) if shape else ()
+                    numel = int(np.prod(shape)) if len(shape) > 0 else 1
+                    itemsize = 4
+                    if hasattr(var, 'dtype'):
+                        dt = var.dtype
+                        try:
+                            if hasattr(dt, 'as_numpy_dtype'):
+                                itemsize = np.dtype(dt.as_numpy_dtype).itemsize
+                            else:
+                                itemsize = np.dtype(dt).itemsize
+                        except Exception:
+                            itemsize = 4
                     return numel * itemsize
                 except Exception:
                     return 4
@@ -411,46 +409,86 @@ class CoordinatedOptimizer:
                 for var in self.base_optimizer.variables:
                     unsharded_total_bytes += _bytes_for_var(var)
 
-            if not self.shard_optimizer_states or not self.sharded_states:
-                replicated_memory_bytes = unsharded_total_bytes * self.world_size
-                replicated_memory_mb = replicated_memory_bytes / (1024 * 1024)
+            if not hasattr(self, 'sharded_states') or not self.sharded_states:
+                total_memory_bytes = unsharded_total_bytes * max(self.world_size, 1)
+                sharded_memory_bytes = total_memory_bytes
+
+                total_memory_mb = total_memory_bytes / (1024 * 1024)
                 return {
                     'sharding_enabled': False,
                     'world_size': self.world_size,
-                    'total_memory': f"{replicated_memory_mb:.2f} MB (Replicated)",
-                    'sharded_memory': f"{replicated_memory_mb:.2f} MB",
+                    'total_memory': f"{total_memory_mb:.2f} MB",
+                    'sharded_memory': f"{total_memory_mb:.2f} MB",
                     'memory_savings': '0.00%',
+                    'total_memory_bytes': total_memory_bytes,
+                    'sharded_memory_bytes': sharded_memory_bytes
                 }
 
+            total_memory_bytes = 0
             sharded_memory_bytes = 0
+            
             for state_name, state_info in self.sharded_states.items():
                 if isinstance(state_info, dict):
                     for var_name, var_states in state_info.items():
-                        if isinstance(var_states, list) and var_states:
-                            # Memory is sum of shards
+                        if isinstance(var_states, list):
                             for shard_state in var_states:
-                                sharded_memory_bytes += shard_state.nbytes
-                elif isinstance(state_info, list) and state_info:
-                     for shard_state in state_info:
-                        sharded_memory_bytes += shard_state.nbytes
-
-            replicated_memory_bytes = unsharded_total_bytes * self.world_size
-            savings_bytes = replicated_memory_bytes - sharded_memory_bytes
-            savings_percentage = (savings_bytes / replicated_memory_bytes) * 100 if replicated_memory_bytes > 0 else 0
+                                if hasattr(shard_state, 'numel'):
+                                    shard_memory = shard_state.numel() * shard_state.element_size()
+                                    total_memory_bytes += shard_memory
+                                    sharded_memory_bytes += shard_memory
+                                elif hasattr(shard_state, 'nbytes'):
+                                    shard_memory = shard_state.nbytes
+                                    total_memory_bytes += shard_memory
+                                    sharded_memory_bytes += shard_memory
+                                elif hasattr(shard_state, 'shape'):
+                                    shard_memory = np.prod(shard_state.shape) * 4
+                                    total_memory_bytes += shard_memory
+                                    sharded_memory_bytes += shard_memory
+                else:
+                    if isinstance(state_info, list):
+                        for shard_state in state_info:
+                            if hasattr(shard_state, 'numel'):
+                                shard_memory = shard_state.numel() * shard_state.element_size()
+                                total_memory_bytes += shard_memory
+                                sharded_memory_bytes += shard_memory
+                            elif hasattr(shard_state, 'nbytes'):
+                                shard_memory = shard_state.nbytes
+                                total_memory_bytes += shard_memory
+                                sharded_memory_bytes += shard_memory
+                            elif hasattr(shard_state, 'shape'):
+                                shard_memory = np.prod(shard_state.shape) * 4
+                                total_memory_bytes += shard_memory
+                                sharded_memory_bytes += shard_memory
             
+            if unsharded_total_bytes > 0:
+                replicated_memory_bytes = unsharded_total_bytes * max(self.world_size, 1)
+                savings_bytes = replicated_memory_bytes - sharded_memory_bytes
+                savings_percentage = (savings_bytes / replicated_memory_bytes) * 100
+                
+                memory_savings = f"{savings_percentage:.2f}%"
+            else:
+                memory_savings = "0.00%"
+
+            total_memory_mb = sharded_memory_bytes / (1024 * 1024)
             sharded_memory_mb = sharded_memory_bytes / (1024 * 1024)
             
             return {
                 'sharding_enabled': True,
-                'world_size': self.world_size,
+                'total_memory': f"{total_memory_mb:.2f} MB",
                 'sharded_memory': f"{sharded_memory_mb:.2f} MB",
-                'memory_savings': f"{savings_percentage:.2f}%",
+                'memory_savings': memory_savings,
+                'world_size': self.world_size,
+                'total_memory_bytes': sharded_memory_bytes,
+                'sharded_memory_bytes': sharded_memory_bytes
             }
             
         except Exception as e:
             logger.warning(f"Memory calculation failed: {e}")
             return {
-                'sharding_enabled': self.shard_optimizer_states,
+                'sharding_enabled': False,
+                'total_memory': '0.00 MB',
+                'sharded_memory': '0.00 MB',
+                'memory_savings': '0.00%',
                 'error': str(e)
             }
 
@@ -536,6 +574,7 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             tensor_parallel_config=tensor_parallel_config 
         )
         self.world_size = world_size
+        self.base_optimizer = base_optimizer
     
     def apply_gradients(self, gradients_and_vars, **kwargs):
         if isinstance(gradients_and_vars, list) and len(gradients_and_vars) > 0:
@@ -550,8 +589,9 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     def _apply_standard_gradients(self, gradients_and_vars):
         try:
             self.base_optimizer.apply_gradients(gradients_and_vars)
+            return gradients_and_vars
         except Exception as e:
-            pass # Fail silently if base optimizer fails
+            return gradients_and_vars
            
     def get_config(self):
         config = super().get_config()
@@ -567,10 +607,6 @@ class TensorParallelOptimizer(optimizers.Optimizer):
     def set_weights(self, weights):
         return self.coordinated_optimizer.set_weights(weights)
     
-    def get_memory_usage(self):
-        """Delegates memory usage analysis to the internal CoordinatedOptimizer."""
-        return self.coordinated_optimizer.get_memory_usage()
-
     def update_step(self, gradient, variable, *args, **kwargs):
         if hasattr(self.base_optimizer, 'update_step'):
             try:
@@ -605,4 +641,4 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             gv = list(zip(gradients, variables))
             return self._apply_standard_gradients(gv)
         return self._apply_standard_gradients(gradients)
-
+    

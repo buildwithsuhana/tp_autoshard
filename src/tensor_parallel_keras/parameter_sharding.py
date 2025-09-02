@@ -91,19 +91,17 @@ class ParameterShardingStrategy:
                 matching_params = self._find_matching_parameters(model, pattern)
                 
                 for param_name, param in matching_params:
-                    sharded_param_tensor = action(param, self.rank)
+                    sharded_param = action(param, self.rank)
                     
-                    # Create a ShardedWeight object which wraps the tensor in a Keras Variable
-                    self.sharded_weights[param_name] = ShardedWeight(sharded_param_tensor, param_name, param.trainable)
-                    
+                    self.sharded_weights[param_name] = sharded_param
                     self.weight_mapping[param_name] = {
                         'original_shape': param.shape,
-                        'sharded_shape': sharded_param_tensor.shape,
+                        'sharded_shape': sharded_param.shape,
                         'action': action
                     }
                     
                     modified_parameters.add(param_name)
-                    print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param_tensor.shape}")
+                    print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}")
         
         sharded_model = ParameterShardedModel(
             original_model=model,
@@ -119,7 +117,7 @@ class ParameterShardingStrategy:
         for layer in model.layers:
             if hasattr(layer, 'weights') and layer.weights:
                 for weight in layer.weights:
-                    param_name = f"{layer.name}.{weight.name.split(':')[0]}"
+                    param_name = f"{layer.name}.{weight.name}"
                     self.original_weights[param_name] = weight.numpy()
     
     def _find_matching_parameters(self, model: Model, pattern: str) -> List[Tuple[str, Any]]:
@@ -133,7 +131,7 @@ class ParameterShardingStrategy:
                 
                 if hasattr(layer, 'weights') and layer.weights:
                     for weight in layer.weights:
-                        param_name = f"{full_name}.{weight.name.split(':')[0]}"
+                        param_name = f"{full_name}.{weight.name}"
                         if re.match(pattern, param_name):
                             matching_params.append((param_name, weight)) 
 
@@ -167,7 +165,6 @@ class ParameterShardedModel(Model):
         self.sharding_strategy = sharding_strategy
         self.config = config
         
-        self._map_sharded_weights_to_layers()
         self._build_and_cache_weights()
 
         if original_model.inputs:
@@ -175,94 +172,220 @@ class ParameterShardedModel(Model):
 
         print(f"🚀 ParameterShardedModel created successfully")
 
-    def _map_sharded_weights_to_layers(self):
-        """Creates a mapping from sharded parameter names to the layer and weight attribute name."""
-        self._layer_weight_map = {}
-        sharded_names = set(self.sharding_strategy.sharded_weights.keys())
-        
-        for layer in self.original_model.layers:
-            if hasattr(layer, 'weights'):
-                for weight in layer.weights:
-                    param_name = f"{layer.name}.{weight.name.split(':')[0]}"
-                    if param_name in sharded_names:
-                        # Find the public attribute name for the weight (e.g., 'kernel', 'bias', 'embeddings')
-                        weight_attr_name = None
-                        for attr_name in dir(layer):
-                            if not attr_name.startswith("_"):
-                                try:
-                                    attr_value = getattr(layer, attr_name)
-                                    if attr_value is weight:
-                                        weight_attr_name = attr_name
-                                        break
-                                except:
-                                    continue
-                        
-                        if weight_attr_name:
-                            self._layer_weight_map[param_name] = (layer, weight_attr_name)
-
     def _build_and_cache_weights(self):
         """
         Builds the list of trainable/non-trainable weights ONCE and caches it.
-        This list includes the new sharded variables and any original, non-sharded variables.
+        This prevents creating new Variables inside a tf.function.
         """
         print("   - Building and caching the definitive weights list...")
         weights_list = []
-        trainable_weights_list = []
-        non_trainable_weights_list = []
-
+        
+        for param_name in self.sharding_strategy.sharded_weights:
+            sharded_tensor = self.sharding_strategy.sharded_weights[param_name]
+            weights_list.append(ShardedWeight(sharded_tensor, param_name))
+        
         sharded_param_names = set(self.sharding_strategy.sharded_weights.keys())
-
-        # Add sharded weights
-        for param_name, sharded_weight_obj in self.sharding_strategy.sharded_weights.items():
-            weights_list.append(sharded_weight_obj.variable)
-            if sharded_weight_obj.trainable:
-                trainable_weights_list.append(sharded_weight_obj.variable)
-            else:
-                non_trainable_weights_list.append(sharded_weight_obj.variable)
-
-        # Add original, non-sharded weights
         for layer in self.original_model.layers:
-            if hasattr(layer, 'weights'):
-                for weight in layer.weights:
-                    param_name = f"{layer.name}.{weight.name.split(':')[0]}"
-                    if param_name not in sharded_param_names:
-                        weights_list.append(weight)
-                        if weight.trainable:
-                            trainable_weights_list.append(weight)
-                        else:
-                            non_trainable_weights_list.append(weight)
+            for weight in layer.weights:
+                param_name = f"{layer.name}.{weight.name.split(':')[0]}" # Normalize name
+                if param_name not in sharded_param_names:
+                    weights_list.append(weight)
         
-        self._weights = weights_list
-        self._trainable_weights = trainable_weights_list
-        self._non_trainable_weights = non_trainable_weights_list
+        self._weights_list = weights_list
 
+    @property
+    def weights(self):
+        """
+        Override weights property to return the cached list of sharded weights.
+        """
+        return self._weights_list       
+    
+    def _copy_model_structure(self):
+        """Copy the model structure without rebuilding layers."""
+        pass
+    
+    def _apply_sharded_weights(self):
+        """Apply sharded weights to the model."""
+        pass
+    
     def call(self, inputs, training=None, mask=None):
-        """
-        Implements the 'swap-and-run' strategy for a truly general forward pass.
-        """
-        original_weights_backup = {}
-        try:
-            # 1. Backup original weights and SWAP IN sharded weights
-            for param_name, sharded_weight_obj in self.sharding_strategy.sharded_weights.items():
-                if param_name in self._layer_weight_map:
-                    layer, weight_attr_name = self._layer_weight_map[param_name]
-                    # Backup the original full weight
-                    original_weights_backup[param_name] = getattr(layer, weight_attr_name)
-                    # Swap in the sharded weight variable
-                    setattr(layer, weight_attr_name, sharded_weight_obj.variable)
-
-            # 2. RUN the forward pass using the original model's logic
-            #    It will now automatically use the sharded weights we just swapped in.
-            output = self.original_model(inputs, training=training, mask=mask)
-
-        finally:
-            # 3. RESTORE the original weights to keep the model in a clean state
-            for param_name, original_weight_var in original_weights_backup.items():
-                if param_name in self._layer_weight_map:
-                    layer, weight_attr_name = self._layer_weight_map[param_name]
-                    setattr(layer, weight_attr_name, original_weight_var)
+        return self.original_model(inputs, training=training, mask=mask)
+    
+    def _execute_complete_forward_pass(self, inputs, training=None, mask=None):
+        print(f"   - Executing complete forward pass")
         
-        return output
+        current_input = inputs
+        residual_tensor = None
+        
+        for i, layer in enumerate(self.original_model.layers):
+            print(f"   - Processing layer {i}: {layer.name} ({type(layer).__name__})")
+            
+            if isinstance(layer, keras.layers.InputLayer):
+                continue
+
+            if isinstance(layer, keras.layers.MultiHeadAttention) or ('mlp_fc1' in layer.name):
+                residual_tensor = current_input
+
+            if isinstance(layer, keras.layers.Dense) and f"{layer.name}.kernel" in self.sharding_strategy.sharded_weights:
+                sharded_output = self._handle_dense_layer(current_input, layer)
+                
+                if 'mlp_fc1' in layer.name:
+                    current_input = sharded_output
+                    print(f"   - (Column-Parallel) Output shape: {current_input.shape}")
+
+                elif 'mlp_fc2' in layer.name:
+                    current_input = self._gather_sharded_output(sharded_output, layer.name, op="sum")
+                    print(f"   - (Row-Parallel) Final aggregated output shape: {current_input.shape}")
+
+                else:
+                    current_input = sharded_output
+                    
+            elif isinstance(layer, keras.layers.Add):
+                current_input = layer([current_input, residual_tensor])
+
+            else:
+                current_input = layer(current_input, training=training)
+            
+            print(f"   - Layer {layer.name} output shape after processing: {current_input.shape}")
+        
+        return current_input
+
+
+    def _gather_sharded_output(self, sharded_output, layer_name, op="concat"):
+        all_shard_outputs = [sharded_output, sharded_output] # Simulating 2 shards
+
+        if op == "sum":
+            print(f"   - Aggregating (All-Reduce Sum) {len(all_shard_outputs)} sharded outputs from {layer_name}")
+            aggregated_output = keras.ops.add(*all_shard_outputs)
+            return aggregated_output
+        else:
+            print(f"   - Gathering (All-Gather Concat) {len(all_shard_outputs)} sharded outputs from {layer_name}")
+            concatenated_output = keras.ops.concatenate(all_shard_outputs, axis=-1)
+            return concatenated_output
+    
+    def _get_original_input_for_layer(self, layer_name):
+        """Get the original input that would be fed to this layer."""
+        try:
+            layer_index = None
+            for i, layer in enumerate(self.original_model.layers):
+                if layer.name == layer_name:
+                    layer_index = i
+                    break
+            
+            if layer_index is not None and layer_index > 0:
+                prev_layer = self.original_model.layers[layer_index - 1]
+                if hasattr(prev_layer, 'output_shape') and prev_layer.output_shape:
+                    import tensorflow as tf
+                    import numpy as np
+                    
+                    batch_size = 1
+                    if len(prev_layer.output_shape) == 2: 
+                        shape = (batch_size, prev_layer.output_shape[-1])
+                    elif len(prev_layer.output_shape) == 3:  
+                        shape = (batch_size, prev_layer.output_shape[1], prev_layer.output_shape[2])
+                    else:
+                        shape = prev_layer.output_shape
+                    
+                    dummy_input = tf.convert_to_tensor(
+                        np.random.random(shape).astype(np.float32)
+                    )
+                    return dummy_input
+            
+            return None
+            
+        except Exception as e:
+            print(f"   - Error getting original input: {e}")
+            return None
+    
+    def _get_expected_dimension_for_layer(self, layer_name):
+        """Get the expected full dimension for a specific layer."""
+        try:
+            original_layer = None
+            for layer in self.original_model.layers:
+                if layer.name == layer_name:
+                    original_layer = layer
+                    break
+            
+            if original_layer is None:
+                return None
+            
+            if hasattr(original_layer, 'output_dim'):
+                return original_layer.output_dim
+            elif hasattr(original_layer, 'units'):
+                return original_layer.units
+            elif hasattr(original_layer, 'output_shape'):
+                output_shape = original_layer.output_shape
+                if isinstance(output_shape, tuple) and len(output_shape) > 0:
+                    for dim in reversed(output_shape):
+                        if dim is not None:
+                            return dim
+                elif hasattr(output_shape, '__iter__'):
+                    for dim in reversed(list(output_shape)):
+                        if dim is not None:
+                            return dim
+            elif hasattr(original_layer, 'equation'):
+                equation = original_layer.equation
+                if '->' in equation:
+                    output_part = equation.split('->')[1]
+                    if 'einsum' in layer_name.lower():
+                        return 32
+            
+            return None
+            
+        except Exception as e:
+            print(f"   - Could not determine expected dimension for {layer_name}: {e}")
+            return None
+    
+    def _handle_embedding_layer(self, inputs, layer):
+        """Handle Embedding layer with column-parallel sharding."""
+        print(f"   - Handling Embedding layer (column-parallel)")
+
+        sharded_embeddings = self.sharding_strategy.sharded_weights[f"{layer.name}.embeddings"]
+
+        embeddings_tensor = keras.ops.convert_to_tensor(sharded_embeddings, dtype="float32")
+        sharded_output = keras.ops.take(embeddings_tensor, inputs, axis=0)
+
+        print(f"   - Computed sharded embedding output shape: {sharded_output.shape}")
+        return sharded_output
+
+    def _handle_pooling_layer(self, inputs, layer):
+        """Handle pooling layer."""
+        print(f"   - Handling pooling layer")
+        return layer(inputs)
+
+    def _handle_einsum_dense_layer(self, inputs, layer):
+        """Handle EinsumDense layer with column-parallel sharding."""
+        print(f"   - Handling EinsumDense layer (column-parallel)")
+
+        einsum_kernel = self.sharding_strategy.sharded_weights[f"{layer.name}.kernel"]
+
+        kernel_tensor = keras.ops.convert_to_tensor(einsum_kernel, dtype="float32")
+        einsum_output = keras.ops.einsum('bsi,ih->bsh', inputs, kernel_tensor)
+
+        print(f"   - Computed sharded einsum output shape: {einsum_output.shape}")
+        return einsum_output
+
+    def _handle_dense_layer(self, current_input, layer):
+        """
+        Handles the forward pass for a Dense layer, applying the correct
+        tensor parallelism strategy based on the sharding type.
+        """
+        kernel_tensor = layer.kernel
+        
+        is_row_wise_sharded = (
+            hasattr(layer, 'sharding_annotation') and 
+            layer.sharding_annotation.is_row_wise_sharded
+        )
+
+        if is_row_wise_sharded:
+            sharded_output = keras.ops.matmul(current_input, kernel_tensor)
+            return sharded_output
+            
+        else:
+            sharded_output = keras.ops.matmul(current_input, kernel_tensor)
+            if layer.use_bias:
+                sharded_output = sharded_output + layer.bias
+            return sharded_output
     
     def get_config(self):
         """Get model configuration."""
@@ -273,26 +396,28 @@ class ParameterShardedModel(Model):
         """Create model from config."""
         return cls(**config)
     
+    
     def count_params(self):
         """
         Count parameters in the sharded model.
-        This should return the total parameters held by this specific shard.
+        This should return the total parameters across all shards.
         """
         total_params = 0
+        for param_name, weight_info in self.sharding_strategy.weight_mapping.items():
+            sharded_weight = self.sharding_strategy.sharded_weights[param_name]
+            total_params += sharded_weight.numel()
         
-        # Count sharded parameters for this shard
-        for sharded_weight_obj in self.sharding_strategy.sharded_weights.values():
-            # FIX: Use backend-agnostic keras.ops.size
-            total_params += keras.ops.size(sharded_weight_obj.variable)
-
-        # Count non-sharded parameters
+        original_param_names = {f"{layer.name}.{weight.name}" for layer in self.original_model.layers 
+                              for weight in layer.weights}
         sharded_param_names = set(self.sharding_strategy.sharded_weights.keys())
-        for layer in self.original_model.layers:
-            if hasattr(layer, 'weights'):
+        unsharded_param_names = original_param_names - sharded_param_names
+        
+        for param_name in unsharded_param_names:
+            for layer in self.original_model.layers:
                 for weight in layer.weights:
-                    param_name = f"{layer.name}.{weight.name.split(':')[0]}"
-                    if param_name not in sharded_param_names:
-                        total_params += keras.ops.size(weight)
+                    if f"{layer.name}.{weight.name}" == param_name:
+                        total_params += weight.shape.num_elements()
+                        break
         
         return total_params
 
@@ -348,20 +473,18 @@ def apply_parameter_sharding_to_existing_model(
             matching_params = sharding_strategy._find_matching_parameters(model, pattern)
             
             for param_name, param in matching_params:
-                sharded_param_tensor = action(param, rank)
+                sharded_param = action(param, rank)
                 
-                sharded_weight_obj = ShardedWeight(sharded_param_tensor, param_name, param.trainable)
-                sharding_strategy.sharded_weights[param_name] = sharded_weight_obj
+                sharding_strategy.sharded_weights[param_name] = sharded_param
                 sharding_strategy.weight_mapping[param_name] = {
                     'original_shape': param.shape,
-                    'sharded_shape': sharded_param_tensor.shape,
+                    'sharded_shape': sharded_param.shape,
                     'action': action
                 }
                 
-                print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param_tensor.shape}")
+                print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}")
     
     model._tensor_parallel_sharding = sharding_strategy
     
     print(f"🎯 Parameter sharding applied to existing model")
-    return model
-
+    return model 

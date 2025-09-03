@@ -456,57 +456,79 @@ class DistributedBackend:
     def _get_pytorch_communication_ops(self):
         """Get PyTorch communication operations using torch.distributed."""
         import torch
-        
-        def all_reduce_torch(tensor, op="sum"):
-            if op == "sum":
-                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            elif op == "mean":
-                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-                tensor /= dist.get_world_size()
-            return tensor
+        import torch.distributed as dist
 
-        def all_gather_torch(tensor, axis=-1):
+        def all_reduce_torch(x, op="sum"):
+            """Performs an all-reduce operation (sum or mean). In-place."""
+            if op == "sum":
+                dist.all_reduce(x, op=dist.ReduceOp.SUM)
+            elif op == "mean":
+                dist.all_reduce(x, op=dist.ReduceOp.SUM)
+                x /= dist.get_world_size()
+            else:
+                raise ValueError(f"Unsupported all_reduce op: {op}")
+            return x
+
+        def all_gather_torch(x, axis=0):
+            """Gathers tensors from all processes and concatenates them."""
             world_size = dist.get_world_size()
-            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
-            dist.all_gather(tensor_list, tensor)
+            tensor_list = [torch.empty_like(x) for _ in range(world_size)]
+            dist.all_gather(tensor_list, x)
             return torch.cat(tensor_list, dim=axis)
 
         def broadcast_torch(x, root=0):
             dist.broadcast(x, src=root)
             return x
 
-        def scatter_torch(x):
-            return x
+        def scatter_torch(x, root=0):
+            """Scatters a tensor from the root process to all processes."""
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            
+            if rank == root:
+                if x.shape[0] % world_size != 0:
+                    raise ValueError(
+                        "For scatter, the first dimension of the tensor "
+                        f"({x.shape[0]}) must be divisible by world_size ({world_size})."
+                    )
+                scatter_list = list(torch.chunk(x, world_size, dim=0))
+            else:
+                scatter_list = None
 
-        def all_reduce_simulated(x, op="sum"):
-            return keras.ops.sum(keras.ops.stack(x), axis=0)
-
-        def all_gather_simulated(x, axis=0):
-            return keras.ops.concatenate(x, axis=axis)
+            chunk_shape = (x.shape[0] // world_size,) + x.shape[1:]
+            output_tensor = torch.empty(chunk_shape, dtype=x.dtype, device=x.device)
+            
+            dist.scatter(output_tensor, scatter_list, src=root)
+            return output_tensor
         
-        def broadcast_simulated(x):
+        def no_op_simulated(x, **kwargs):
+            """Simulated op for a single device; it's a no-op."""
             return x
         
-        def scatter_simulated(x, num_devices):
-            return keras.ops.split(x, num_devices, axis=0)
+        def scatter_simulated(x, **kwargs):
+            """In a single-device simulation, scatter returns the whole tensor."""
+            return x
 
         try:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                logger.info("Using real torch.distributed communication ops.")
-                return {
-                    "all_reduce": lambda x, op="sum": dist.all_reduce(x, op=dist.ReduceOp.SUM) or x,
-                    "all_gather": self._pytorch_all_gather_wrapper,
-                }
-        except (ImportError, RuntimeError):
-            pass
+            if not (dist.is_available() and dist.is_initialized()):
+                raise RuntimeError("torch.distributed is not available or not initialized.")
+            
+            logger.info("Using real torch.distributed communication ops.")
+            return {
+                "all_reduce": all_reduce_torch,
+                "all_gather": all_gather_torch,
+                "broadcast": broadcast_torch,
+                "scatter": scatter_torch,
+            }
         
-        logger.warning("torch.distributed not available or initialized. Using SIMULATED communication ops.")
-        world_size = 1
-        return {
-            "all_reduce": lambda x, op="sum": x,
-            "all_gather": lambda x, axis=-1: torch.cat([x] * world_size, dim=axis),
-        }
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"torch.distributed not available: {e}. Using SIMULATED communication ops.")
+            return {
+                "all_reduce": no_op_simulated,
+                "all_gather": no_op_simulated,
+                "broadcast": no_op_simulated,
+                "scatter": scatter_simulated,
+            }
     
     def _get_numpy_communication_ops(self):
         """Get NumPy communication operations (simplified)."""

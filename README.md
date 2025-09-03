@@ -1,6 +1,6 @@
 # Tensor Parallel for Keras 3.0
 
-A production-ready **TRUE TENSOR PARALLELISM** implementation for Keras 3.0, supporting distributed training across multiple devices with automatic parameter sharding, **local gradient computation (no all-reduce)**, and optimizer state sharding.
+A production-ready **TRUE TENSOR PARALLELISM** implementation for Keras 3.0, supporting distributed training across multiple devices with automatic parameter sharding, **optimized gradient computation (minimal all-reduce)**, and optimizer state sharding.
 
 ## 🚀 **TRUE TENSOR PARALLELISM IMPLEMENTATION**
 
@@ -9,17 +9,17 @@ This project implements **true tensor parallelism** (not FSDP-style), where:
 - **Data is REPLICATED** across all devices (not sharded)
 - **Parameters are SHARDED** across devices  
 - **Outputs are PARTIAL** per shard (no gathering)
-- **Gradients are LOCAL** (no all-reduce needed)
+- **Gradients are MOSTLY LOCAL** (all-reduce used only for column-parallel layers)
 - **Optimizer states are SHARDED** with parameters
-- **NO communication** between devices during training
+- **MINIMAL communication** between devices during training
 
 ## Features
 
-- ✅ **TRUE Tensor Parallelism**: Parameter sharding, **local gradients (no all-reduce)**, optimizer state sharding
+- ✅ **TRUE Tensor Parallelism**: Parameter sharding, **optimized gradients (minimal all-reduce)**, optimizer state sharding
 - ✅ **Data Replication**: Input data replicated across all devices (not sharded)
 - ✅ **Partial Outputs**: Each shard produces partial outputs (no gathering needed)
-- ✅ **Local Gradient Computation**: Gradients computed locally on partial outputs
-- ✅ **No Communication Overhead**: No all-reduce or gradient synchronization required
+- ✅ **Optimized Gradient Computation**: Gradients for row-parallel layers are computed locally, while column-parallel layers use an efficient all-reduce.
+- ✅ **Minimal Communication Overhead**: Communication is limited to input replication and a single all-reduce for column-parallel layers.
 - ✅ **KerasNLP Integration**: Native support for BERT, GPT-2, RoBERTa, OPT, and other transformer models
 - ✅ **Multi-Backend Support**: JAX, PyTorch, and TensorFlow distributed backends
 - ✅ **Automatic Sharding**: Intelligent parameter distribution across devices (always optimal)
@@ -111,6 +111,7 @@ Device 0: Partial output 0 → Local gradients for shard 0 → Update shard 0
 Device 1: Partial output 1 → Local gradients for shard 1 → Update shard 1
 Device 2: Partial output 2 → Local gradients for shard 2 → Update shard 2
 ...
+(Note: All-Reduce is only used to synchronize gradients for column-parallel layers)
 ```
 
 ### **Key Differences from FSDP**
@@ -118,8 +119,8 @@ Device 2: Partial output 2 → Local gradients for shard 2 → Update shard 2
 |--------|------|------------------------|
 | **Data** | Sharded | **Replicated** |
 | **Outputs** | Gathered | **Partial per shard** |
-| **Gradients** | All-reduce | **Local only** |
-| **Communication** | All-gather + Reduce-scatter | **Input replication only** |
+| **Gradients** | All-reduce | **Local for row-parallel, All-reduce for column-parallel** |
+| **Communication** | All-gather + Reduce-scatter | **Input replication + All-reduce for column-parallel layers** |
 | **Memory** | Duplicate parameters | **Sharded parameters** |
 
 ### **Memory and Efficiency Benefits**
@@ -127,9 +128,9 @@ Device 2: Partial output 2 → Local gradients for shard 2 → Update shard 2
 - **Parameter storage**: N devices × (1/N of parameters) = Same total memory
 - **Optimizer states**: N devices × (1/N of optimizer states) = Same total memory
 - **No duplicate storage** of parameters or optimizer states
-- **No all-reduce overhead** during training
-- **Independent parameter updates** per device
-- **Scalable to many devices** without communication overhead
+- **Minimal all-reduce overhead** during training (only for column-parallel layers)
+- **Mostly independent parameter updates** per device
+- **Scalable to many devices** with minimal communication overhead
 
 ### Advanced Configuration
 
@@ -235,9 +236,9 @@ tp_model = TensorParallelKeras(
 - **Data Replication**: Input data replicated across all devices (not sharded)
 - **Parameter Sharding**: Model weights sharded across devices
 - **Partial Outputs**: Each shard produces partial outputs (no gathering)
-- **Local Gradients**: Gradients computed locally on partial outputs
-- **No Communication**: No all-reduce or gradient synchronization needed
-- **Independent Updates**: Each device updates its own parameters
+- **Optimized Gradients**: Gradients for row-parallel layers are local, while column-parallel layers use an efficient all-reduce.
+- **Minimal Communication**: Communication is limited to input replication and a single all-reduce for column-parallel layers.
+- **Mostly Independent Updates**: Each device updates its own parameters, with a synchronization step for column-parallel layers.
 
 ### Parameter-Level Sharding
 - **Preserves Model Structure**: No graph rebuilding required
@@ -268,7 +269,7 @@ tp_model = TensorParallelKeras(
 ### **Test Coverage**
 - ✅ Parameter sharding verification
 - ✅ Inference numerical correctness  
-- ✅ Gradient synchronization verification (no all-reduce needed)
+- ✅ Gradient synchronization verification
 - ✅ Optimizer sharding verification
 - ✅ EinsumDense layer support
 - ✅ End-to-end training verification
@@ -295,14 +296,14 @@ python test_sharded_optimizer.py
 ### **TRUE Tensor Parallelism Benefits**
 - **Memory Reduction**: Up to 50% memory savings per device
 - **Training Speed**: Near-linear scaling with device count
-- **Communication Overhead**: **ZERO** - no all-reduce or gradient synchronization
+- **Communication Overhead**: **MINIMAL** - a single all-reduce for column-parallel layers
 - **Scalability**: Tested up to 4 devices (extensible to many more)
 - **Auto-Optimization**: Always uses best sharding strategy
 
 ### **Efficiency Gains**
-- **No All-Reduce Overhead**: Gradients computed locally (no communication)
-- **Independent Updates**: Each device updates parameters without waiting
-- **Input Replication Only**: Minimal communication during forward pass
+- **Minimal All-Reduce Overhead**: Gradients for row-parallel layers are computed locally, while column-parallel layers use an efficient all-reduce.
+- **Mostly Independent Updates**: Each device updates parameters with a synchronization step for column-parallel layers.
+- **Optimized Communication**: Communication is limited to input replication and a single all-reduce for column-parallel layers during the backward pass.
 - **Sharded Optimizer States**: Memory efficient optimizer state management
 
 ## Production Usage
@@ -330,9 +331,9 @@ This implementation is **100% production-ready** with:
 1. **✅ True Tensor Parallelism**: Not FSDP-style implementation
 2. **✅ Data Replication**: Input data replicated across devices
 3. **✅ Partial Outputs**: No output gathering needed
-4. **✅ Local Gradients**: Gradients computed locally on partial outputs
-5. **✅ No All-Reduce**: No gradient synchronization required
-6. **✅ Independent Updates**: Each device updates its own parameters
+4. **✅ Optimized Gradients**: Gradients for row-parallel layers are local, while column-parallel layers use an efficient all-reduce.
+5. **✅ Minimal All-Reduce**: A single all-reduce is used for column-parallel layers.
+6. **✅ Mostly Independent Updates**: Each device updates its own parameters, with a synchronization step for column-parallel layers.
 7. **✅ Optimizer State Sharding**: Efficient memory usage
 8. **✅ All Tests Passing**: Implementation verified and working
 
@@ -340,8 +341,8 @@ This implementation is **100% production-ready** with:
 - **Data Distribution**: Input data is **REPLICATED** across all devices (not sharded)
 - **Parameter Sharding**: Model weights are sharded across devices
 - **Output Handling**: Each shard produces **PARTIAL outputs** (no gathering)
-- **Gradient Computation**: **LOCAL gradients** computed on partial outputs
-- **No Communication**: **NO all-reduce or gradient synchronization** needed
+- **Gradient Computation**: **Optimized gradients** computed on partial outputs (local for row-parallel, all-reduce for column-parallel)
+- **Minimal Communication**: **Minimal all-reduce and gradient synchronization** needed
 - **Optimizer States**: **SHARDED with parameters** for memory efficiency
 
 This implementation is **fundamentally different from FSDP** and represents the **correct approach to tensor parallelism** as specified in the requirements.

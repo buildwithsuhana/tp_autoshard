@@ -38,6 +38,10 @@ class ShardedWeight:
     def shape(self):
         """Returns the shape of the variable."""
         return self._variable.shape
+    @property
+    def dtype(self):
+        """Returns the dtype of the underlying variable."""
+        return self._variable.dtype
 
     @property
     def variable(self):

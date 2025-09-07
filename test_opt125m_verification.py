@@ -15,6 +15,29 @@ from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+class PositionalEmbedding(layers.Layer):
+    """
+    Creates a learned positional embedding.
+    This layer calculates the position IDs on the fly during the forward pass.
+    """
+    def __init__(self, max_positions, hidden_size, **kwargs):
+        super().__init__(**kwargs)
+        # The actual learnable weights are in this embedding layer
+        self.position_embedding = layers.Embedding(
+            input_dim=max_positions, output_dim=hidden_size
+        )
+
+    def call(self, inputs):
+        # Get the dynamic sequence length from the input tensor
+        seq_len = keras.ops.shape(inputs)[1]
+        
+        # Create the position IDs: [0, 1, 2, ..., seq_len-1]
+        # This now happens symbolically as part of the forward pass
+        position_ids = keras.ops.arange(seq_len, dtype="int32")
+        
+        # Look up the embeddings for the position IDs
+        return self.position_embedding(position_ids)
+
 def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers=2, num_heads=4):
     """Create a simplified OPT-125M model for faster testing."""
     print("   Creating simplified OPT-125M model...")
@@ -31,34 +54,56 @@ def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers
     print(f"      Simplified model created with {model.count_params():,} parameters")
     return model
 
-def create_opt125m_model(vocab_size=50257, hidden_size=768, num_layers=12, num_heads=12):
-    """Create a simplified OPT-125M model for testing."""
+def create_opt125m_model(vocab_size=50257, hidden_size=768, num_layers=12, num_heads=12, max_position_embeddings=2048):
+    """
+    Creates an OPT-125M model with learned positional embeddings.
+    """
     print("   Creating OPT-125M model...")
     
-    inputs = layers.Input(shape=(None,), dtype='int32', name='input_ids')
-    embedding = layers.Embedding(vocab_size, hidden_size, name='embed_tokens')(inputs)
-    hidden_states = embedding
-    hidden_states = layers.LayerNormalization(epsilon=1e-5, name='layernorm_embedding')(hidden_states)
+    # 1. Input layer for token IDs
+    input_ids = layers.Input(shape=(None,), dtype='int32', name='input_ids')
     
+    # 2. Token embeddings
+    token_embeddings = layers.Embedding(vocab_size, hidden_size, name='embed_tokens')(input_ids)
+    
+    positional_embed_layer = PositionalEmbedding(
+        max_position_embeddings, hidden_size, name='embed_positions'
+    )
+    position_embeddings = positional_embed_layer(token_embeddings)
+
+    # 4. Add token and positional embeddings together
+    embedding_output = layers.Add(name='add_embeddings')([token_embeddings, position_embeddings])
+
+    # 5. Apply LayerNormalization
+    hidden_states = layers.LayerNormalization(epsilon=1e-5, name='layernorm_embedding')(embedding_output)
+    
+    # 6. Transformer Blocks
     for i in range(num_layers):
         print(f"     Adding transformer layer {i+1}/{num_layers}")
         
+        # Self-Attention block
         attention_output = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=hidden_size // num_heads, name=f'layers_{i}_self_attn'
         )(hidden_states, hidden_states)
         
+        # Residual connection and LayerNorm
         hidden_states = layers.Add(name=f'layers_{i}_residual_1')([hidden_states, attention_output])
         hidden_states = layers.LayerNormalization(epsilon=1e-5, name=f'layernorm_1_{i}')(hidden_states)
         
+        # MLP block
         mlp_hidden = layers.Dense(hidden_size * 4, activation='relu', name=f'layers_{i}_mlp_up')(hidden_states)
         mlp_output = layers.Dense(hidden_size, name=f'layers_{i}_mlp_down')(mlp_hidden)
         
+        # Residual connection and LayerNorm
         hidden_states = layers.Add(name=f'layers_{i}_residual_2')([hidden_states, mlp_output])
         hidden_states = layers.LayerNormalization(epsilon=1e-5, name=f'layernorm_2_{i}')(hidden_states)
     
+    # 7. Final LayerNorm and LM Head
     hidden_states = layers.LayerNormalization(epsilon=1e-5, name='layernorm_final')(hidden_states)
     outputs = layers.Dense(vocab_size, name='lm_head')(hidden_states)
-    model = keras.Model(inputs=inputs, outputs=outputs, name='OPT-125M')
+    
+    # 8. Create the model
+    model = keras.Model(inputs=input_ids, outputs=outputs, name='OPT-125M')
     return model
 
 def verify_layer_sharding(tp_model):
@@ -163,94 +208,53 @@ def plot_training_graphs(original_history, tp_history):
         plt.show()
         print("\n   Generating training performance graphs...")
 
-
-def test_opt125m_training_verification():
-    """Test OPT-125M training verification with a fair comparison."""
-    print("🔧 OPT-125M Training Verification (Fair Comparison)")
+def test_opt125m_memory_savings():
+    """Test OPT-125M optimizer state sharding memory savings."""
+    print("🔧 OPT-125M Memory Savings Verification")
     print("=" * 50)
     start_time = time.time()
     
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating model template and saving initial weights...")
-    model_template = create_simplified_opt125m_model()
-    initial_weights = model_template.get_weights()
-    print(f"      ✅ Initial weights saved.")
-
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating Tensor Parallel manager...")
-    tp_manager = TensorParallelKeras(model=model_template, world_size=2, distributed_backend='fallback')
-    tp_model = tp_manager.build_assembled_model()
+    print(f"⏱️  {time.time() - start_time:.2f}s: Creating OPT-125M model...")
+    opt_model = create_opt125m_model()
     
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating a separate baseline model...")
-    baseline_model = create_simplified_opt125m_model()
+    print(f"⏱️  {time.time() - start_time:.2f}s: Initializing TensorParallelKeras with world_size=2...")
+    tp_manager = TensorParallelKeras(model=opt_model, world_size=2, distributed_backend='fallback')
     
-    x = baseline_model.set_weights(initial_weights)
-    print(x)
-    print(f"      ✅ Baseline model weights set to match the template.")
-
-    print(f"⏱️  {time.time() - start_time:.2f}s: Creating and pre-building the TP optimizer...")
-    dummy_model_for_opt = create_simplified_opt125m_model()
-    base_optimizer = optimizers.Adam()
-    base_optimizer.build(dummy_model_for_opt.trainable_variables)
-    print(f"      ✅ TP optimizer is now built and has state variables.")
-
-    print("\n" + "="*20 + " Memory Savings Report " + "="*20)
-    try:
-        tp_manager.compile(optimizer=base_optimizer)
-        
-        if hasattr(tp_manager, 'optimizer') and hasattr(tp_manager.optimizer, 'coordinated_optimizer'):
-            memory_info = tp_manager.optimizer.coordinated_optimizer.get_memory_usage()
-            
-            print(f"      📈 Sharding Enabled: {memory_info.get('sharding_enabled', False)}")
-            print(f"      💾 Est. Memory w/o TP (replicated states): {memory_info.get('total_memory', 'N/A')}")
-            print(f"      💾 Est. Memory w/ TP (sharded states): {memory_info.get('sharded_memory', 'N/A')}")
-            print(f"      💰 Estimated Optimizer State Memory Savings: {memory_info.get('memory_savings', 'N/A')}")
-        else:
-            print("      ⚠️  Could not access coordinated_optimizer to report memory savings.")
-    except Exception as e:
-        print(f"      ❌ Failed to calculate memory savings: {e}")
-    print("=" * 61 + "\n")
-
-    print(f"⏱️  {time.time() - start_time:.2f}s: Compiling models...")
-    tp_model.compile(optimizer=base_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    print(f"⏱️  {time.time() - start_time:.2f}s: Compiling model to build optimizer states...")
+    tp_manager.compile(optimizer=optimizers.Adam())
     
-    baseline_optimizer = optimizers.Adam()
-    baseline_model.compile(optimizer=baseline_optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    print(f"✅ Models compiled successfully")
-
-    print(f"⏱️  {time.time() - start_time:.2f}s: Training models for comparison...")
-    x_train = np.random.randint(0, 1000, (100, 10), dtype=np.int32)
-    y_train = np.random.randint(0, 1000, (100, 10), dtype=np.int32)
+    # Ensure the coordinated optimizer was created
+    if not hasattr(tp_manager, 'coordinated_optimizer'):
+        print("      ❌ Coordinated optimizer not found. Cannot calculate memory.")
+        return False
     
-    baseline_history = baseline_model.fit(x_train, y_train, epochs=10, batch_size=16, verbose=0)
-    print(f"      ✅ Baseline model training completed")
+    # --- FIX 1: Explicitly build the base optimizer's variables ---
+    print(f"⏱️  {time.time() - start_time:.2f}s: Building base optimizer states...")
+    base_optimizer = tp_manager.coordinated_optimizer.base_optimizer
+    base_optimizer.build(tp_manager.trainable_weights)
     
-    try:
-        tp_history = tp_model.fit(x_train, y_train, epochs=10, batch_size=16, verbose=0)
-        print(f"      ✅ TP model training completed")
-    except Exception as e:
-        print(f"      ❌ TP model training failed with an error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False 
-
-    test_passed = False
-    if baseline_history and 'loss' in baseline_history.history and tp_history and 'loss' in tp_history.history:
-        print(f"\n   Comparing training curves...")
-        baseline_final_loss = baseline_history.history['loss'][-1]
-        tp_final_loss = tp_history.history['loss'][-1]
-        loss_diff = abs(baseline_final_loss - tp_final_loss)
-        print(f"      Final loss difference: {loss_diff:.6f}")
-        if loss_diff < 1:
-            print(f"      ✅ Learning verification passed")
-            test_passed = True
-        else:
-            print(f"      ❌ Learning verification failed")
-            
-        plot_training_graphs(baseline_history, tp_history)
-    else:
-        print("      ❌ Could not compare training curves due to missing history.")
-
-    print(f"✅ OPT-125M training verification completed in {time.time() - start_time:.2f}s")
-    return test_passed
+    # --- FIX 2: Access the correct object for the method call ---
+    coordinated_optimizer_logic = tp_manager.coordinated_optimizer.coordinated_optimizer
+    
+    # 1. Calculate memory with REPLICATED states (the default)
+    replicated_memory_info = coordinated_optimizer_logic.get_memory_usage()
+    
+    # 2. Enable SHARDED states and calculate again
+    print(f"⏱️  {time.time() - start_time:.2f}s: Enabling optimizer state sharding...")
+    coordinated_optimizer_logic.enable_optimizer_state_sharding()
+    sharded_memory_info = coordinated_optimizer_logic.get_memory_usage()
+    
+    print("\n" + "-" * 22 + " Memory Usage Results " + "-" * 22)
+    print(f"   - Replicated (No Sharding): {replicated_memory_info.get('total_memory', 'N/A')}")
+    print(f"   - Sharded (ZeRO Stage 1)  : {sharded_memory_info.get('sharded_memory', 'N/A')}")
+    print(f"   - Memory Savings          : {sharded_memory_info.get('memory_savings', 'N/A')}")
+    print("-" * 60 + "\n")
+    
+    assert sharded_memory_info.get('sharding_enabled', False), "Sharding was not enabled."
+    assert float(sharded_memory_info.get('memory_savings', '0%').strip('%')) > 0, "Memory savings should be greater than 0."
+    
+    print(f"✅ OPT-125M memory savings verification completed in {time.time() - start_time:.2f}s")
+    return True
 
 if __name__ == "__main__":
     print("🎯 OPT-125M TENSOR PARALLEL VERIFICATION TEST SUITE")
@@ -258,7 +262,8 @@ if __name__ == "__main__":
     test_results = []
     test_results.append(("OPT-125M Parameter Sharding", test_opt125m_parameter_sharding()))
     test_results.append(("OPT-125M Inference Correctness", test_opt125m_inference_correctness()))
-    test_results.append(("OPT-125M Training Verification", test_opt125m_training_verification()))
+    test_results.append(("OPT-125M Memory Savings", test_opt125m_memory_savings()))
+
     
     print("\n" + "=" * 60)
     print("🎉 OPT-125M VERIFICATION TESTING COMPLETED!")

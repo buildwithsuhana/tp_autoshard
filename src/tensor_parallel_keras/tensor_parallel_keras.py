@@ -54,18 +54,31 @@ class TensorParallelKeras(keras.Model):
     def build_assembled_model(self):
         """
         Builds a single, JIT-friendly Keras Functional model that encapsulates
-        the entire tensor parallel logic.
+        the entire tensor parallel logic, correctly handling multiple inputs.
         """
         if not self.distributed:
             return self.original_model
 
-        input_layer = self.original_model.inputs[0]
-        partial_outputs = [model(input_layer) for model in self.sharded_models]
+        # --- MODIFIED SECTION START ---
+        # Create a dictionary of Keras Input layers that matches the original
+        # model's signature. This handles models with multiple inputs.
+        input_layers = {
+            # Extract clean name (e.g., 'token_ids') from tensor name (e.g., 'token_ids:0')
+            inp.name.split(':')[0]: keras.Input(
+                shape=inp.shape[1:], dtype=inp.dtype, name=inp.name.split(':')[0]
+            )
+            for inp in self.original_model.inputs
+        }
+
+        # Pass the entire dictionary of input layers to each sharded model.
+        partial_outputs = [model(input_layers) for model in self.sharded_models]
+        # --- MODIFIED SECTION END ---
+
         final_layer = self.original_model.layers[-1]
         sharding_type = "unknown"
         final_kernel_name = f"{final_layer.name}.kernel"
         if hasattr(self.original_model, 'name') and self.original_model.name:
-             final_kernel_name = f"{self.original_model.name}.{final_kernel_name}"
+                final_kernel_name = f"{self.original_model.name}.{final_kernel_name}"
         
         for pattern, action in self.tensor_parallel_config.state_rules.items():
             if re.search(pattern, final_kernel_name):
@@ -74,7 +87,7 @@ class TensorParallelKeras(keras.Model):
                 break
 
         if sharding_type == "column":
-            final_output = ops.concatenate(partial_outputs, axis=-1)
+            final_output = keras.ops.concatenate(partial_outputs, axis=-1)
             original_output_dim = self.original_model.output_shape[-1]
             if final_output.shape[-1] != original_output_dim:
                 final_output = keras.layers.Lambda(
@@ -96,7 +109,12 @@ class TensorParallelKeras(keras.Model):
         else:
             final_output = partial_outputs[0]
 
-        assembled_model = keras.Model(inputs=input_layer, outputs=final_output)
+        # --- MODIFIED SECTION START ---
+        # The final assembled model must be initialized with the same inputs.
+        # We pass the list of input tensors from our dictionary.
+        assembled_model = keras.Model(inputs=list(input_layers.values()), outputs=final_output)
+        # --- MODIFIED SECTION END ---
+        
         return assembled_model
     
     def set_weights(self, weights):

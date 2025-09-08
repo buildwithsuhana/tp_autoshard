@@ -109,12 +109,7 @@ class TensorParallelKeras(keras.Model):
         else:
             final_output = partial_outputs[0]
 
-        # --- MODIFIED SECTION START ---
-        # The final assembled model must be initialized with the same inputs.
-        # We pass the list of input tensors from our dictionary.
-        assembled_model = keras.Model(inputs=list(input_layers.values()), outputs=final_output)
-        # --- MODIFIED SECTION END ---
-        
+        assembled_model = keras.Model(inputs=list(input_layers.values()), outputs=final_output)        
         return assembled_model
     
     def set_weights(self, weights):

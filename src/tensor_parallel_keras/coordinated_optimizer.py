@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 import keras
 from keras import optimizers
 import logging
+import re 
 
 try:
     from .distributed_backend import get_distributed_backend, DistributedBackend
@@ -84,31 +85,68 @@ class CoordinatedOptimizer:
             state_dict[state_name][param_name] = var
 
         return state_dict
-    
+
     def _initialize_sharded_states(self):
         logger.info("Initializing sharded optimizer states...")
-        
+        if not self.shard_optimizer_states:
+            logger.warning("Sharding is disabled; skipping initialization.")
+            return
+
         try:
             base_state = self._get_actual_optimizer_state()
-            
             if not base_state:
                 logger.error("Failed to get optimizer state. Aborting sharding.")
                 self.shard_optimizer_states = False
                 return
 
+            self.sharded_states = {}
+
             for state_name, state_value in base_state.items():
                 if isinstance(state_value, dict):
                     self.sharded_states[state_name] = {}
                     for param_name, param_state_var in state_value.items():
-                        self.sharded_states[state_name][param_name] = self._partition_state_across_shards(param_state_var)
+                        sharding_dim = 0
+                        rule_found = False
+
+                        if self.tensor_parallel_config:
+                            for pattern, action in self.tensor_parallel_config.state_rules.items():
+                                if re.search(pattern, param_name):
+                                    if hasattr(action, 'dim'):
+                                        sharding_dim = action.dim
+                                        rule_found = True
+                                        logger.debug(
+                                            f"Found rule for '{param_name}': "
+                                            f"sharding state on dim={sharding_dim}."
+                                        )
+                                        break
+                        
+                        if not rule_found:
+                            logger.debug(
+                                f"No specific rule for '{param_name}'. "
+                                f"Defaulting to sharding state on dim={sharding_dim}."
+                            )
+
+                        self.sharded_states[state_name][param_name] = self._partition_state_across_shards(
+                            param_state_var,
+                            dim=sharding_dim
+                        )
+
                 else:
-                    self.sharded_states[state_name] = self._partition_state_across_shards(state_value)
+                    self.sharded_states[state_name] = self._partition_state_across_shards(
+                        state_value,
+                        dim=0
+                    )
             
-            logger.info(f"Sharded optimizer states initialized: {list(self.sharded_states.keys())}")
-            
+            logger.info(f"✅ Sharded optimizer states initialized successfully: {list(self.sharded_states.keys())}")
+
         except Exception as e:
-            logger.warning(f"Failed to initialize sharded states: {e}, falling back to replicated states")
+            logger.error(
+                f"Failed during sharded state initialization: {e}. "
+                "Falling back to replicated (non-sharded) optimizer states.",
+                exc_info=True
+            )
             self.shard_optimizer_states = False
+            self.sharded_states = {}
     
     def _get_base_optimizer_state_structure(self):
         """Get the structure of the base optimizer's state."""
@@ -144,33 +182,43 @@ class CoordinatedOptimizer:
         except Exception as e:
             logger.warning(f"Could not determine optimizer state structure: {e}")
             return {'dummy': np.array([0.0])}
-    
-    def _partition_state_across_shards(self, state_variable):
+
+    def _partition_state_across_shards(self, state_variable: any, dim: int):
         try:
             shape = tuple(getattr(state_variable, 'shape', ()))
-            dtype = None
+            dtype = np.float32
             if hasattr(state_variable, 'dtype'):
-                dt = state_variable.dtype
                 try:
+                    dt = state_variable.dtype
                     if hasattr(dt, 'as_numpy_dtype'):
                         dtype = np.dtype(dt.as_numpy_dtype)
                     else:
                         dtype = np.dtype(dt)
-                except Exception:
-                    dtype = None
-            if dtype is None:
-                dtype = np.float32
+                except TypeError:
+                    logger.debug("Could not convert tensor dtype to numpy, using float32.")
+                    dtype = np.float32
 
             state_array = np.zeros(shape, dtype=dtype)
-            if state_array.ndim > 0 and shape[0] not in (None, 0):
-                return np.array_split(state_array, self.world_size, axis=0)
+
+            if state_array.ndim > dim and shape[dim] > 0:
+                logger.debug(f"Partitioning state of shape {shape} along axis {dim}.")
+                return np.array_split(state_array, self.world_size, axis=dim)
             else:
-                return [np.zeros((), dtype=dtype)] * self.world_size
-                
+                if state_array.ndim > 0 and shape[0] > 0:
+                    logger.debug(f"Cannot split shape {shape} on axis {dim}. Falling back to axis 0.")
+                    return np.array_split(state_array, self.world_size, axis=0)
+                else:
+                    logger.debug(f"State is a scalar of shape {shape}. Replicating.")
+                    return [np.copy(state_array) for _ in range(self.world_size)]
+
         except Exception as e:
-            logger.warning(f"Failed to partition state '{getattr(state_variable, 'name', 'N/A')}': {e}, replicating.")
+            param_name = getattr(state_variable, 'name', 'N/A')
+            logger.warning(
+                f"Failed to partition optimizer state '{param_name}': {e}. "
+                "Replicating the state variable across all devices as a fallback."
+            )
             return [state_variable] * self.world_size
-    
+
     def get_config(self):
         return {
             'base_optimizer': self.base_optimizer.get_config(),

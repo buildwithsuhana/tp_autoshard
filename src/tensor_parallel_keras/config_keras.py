@@ -14,7 +14,6 @@ class ConfigKeras:
         world_size = len(devices)
         backend = get_distributed_backend()
         
-        # Pass the backend instance to the constructors
         make_allreduce = lambda ws: AllReduceKeras(ws, backend=backend, op="mean")
         make_allgather = lambda ws, dim: AllGatherKeras(ws, backend=backend, dim=dim)
         make_broadcast = lambda ws: BroadcastKeras(ws, backend=backend)

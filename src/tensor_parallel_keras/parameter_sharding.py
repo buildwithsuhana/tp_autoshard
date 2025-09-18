@@ -4,7 +4,6 @@ This approach shards only the weights/parameters without rebuilding the model st
 Works with ANY Keras model including KerasNLP models.
 """
 
-import copy
 import re
 from typing import Dict, List, Set, Tuple, Any, Optional
 import numpy as np
@@ -85,7 +84,6 @@ class ParameterShardingStrategy:
         Returns:
             Tuple of (sharded_model, modified_parameter_names)
         """
-        print(f"🔧 Applying parameter-level sharding to {model.name}")
         
         self._store_original_weights(model)
         modified_parameters = set()
@@ -105,7 +103,6 @@ class ParameterShardingStrategy:
                     }
                     
                     modified_parameters.add(param_name)
-                    print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}")
         
         sharded_model = ParameterShardedModel(
             original_model=model,
@@ -113,7 +110,6 @@ class ParameterShardingStrategy:
             config=config
         )
         
-        print(f"🎯 Parameter sharding completed: {len(modified_parameters)} parameters sharded")
         return sharded_model, modified_parameters
     
     def _store_original_weights(self, model: Model):
@@ -172,16 +168,16 @@ class ParameterShardedModel(Model):
         self._build_and_cache_weights()
 
         if original_model.inputs:
-             self.build(original_model.inputs[0].shape)
+             # Build with the *list* of input shapes
+             input_shapes = [inp.shape for inp in original_model.inputs]
+             self.build(input_shapes)
 
-        print(f"🚀 ParameterShardedModel created successfully")
 
     def _build_and_cache_weights(self):
         """
         Builds the list of trainable/non-trainable weights ONCE and caches it.
         This prevents creating new Variables inside a tf.function.
         """
-        print("   - Building and caching the definitive weights list...")
         weights_list = []
         
         for param_name in self.sharding_strategy.sharded_weights:
@@ -216,13 +212,11 @@ class ParameterShardedModel(Model):
         return self.original_model(inputs, training=training, mask=mask)
     
     def _execute_complete_forward_pass(self, inputs, training=None, mask=None):
-        print(f"   - Executing complete forward pass")
         
         current_input = inputs
         residual_tensor = None
         
         for i, layer in enumerate(self.original_model.layers):
-            print(f"   - Processing layer {i}: {layer.name} ({type(layer).__name__})")
             
             if isinstance(layer, keras.layers.InputLayer):
                 continue
@@ -235,11 +229,9 @@ class ParameterShardedModel(Model):
                 
                 if 'mlp_fc1' in layer.name:
                     current_input = sharded_output
-                    print(f"   - (Column-Parallel) Output shape: {current_input.shape}")
 
                 elif 'mlp_fc2' in layer.name:
                     current_input = self._gather_sharded_output(sharded_output, layer.name, op="sum")
-                    print(f"   - (Row-Parallel) Final aggregated output shape: {current_input.shape}")
 
                 else:
                     current_input = sharded_output
@@ -250,7 +242,6 @@ class ParameterShardedModel(Model):
             else:
                 current_input = layer(current_input, training=training)
             
-            print(f"   - Layer {layer.name} output shape after processing: {current_input.shape}")
         
         return current_input
 
@@ -259,11 +250,9 @@ class ParameterShardedModel(Model):
         all_shard_outputs = [sharded_output, sharded_output] # Simulating 2 shards
 
         if op == "sum":
-            print(f"   - Aggregating (All-Reduce Sum) {len(all_shard_outputs)} sharded outputs from {layer_name}")
             aggregated_output = keras.ops.add(*all_shard_outputs)
             return aggregated_output
         else:
-            print(f"   - Gathering (All-Gather Concat) {len(all_shard_outputs)} sharded outputs from {layer_name}")
             concatenated_output = keras.ops.concatenate(all_shard_outputs, axis=-1)
             return concatenated_output
     
@@ -298,7 +287,6 @@ class ParameterShardedModel(Model):
             return None
             
         except Exception as e:
-            print(f"   - Error getting original input: {e}")
             return None
     
     def _get_expected_dimension_for_layer(self, layer_name):
@@ -337,36 +325,30 @@ class ParameterShardedModel(Model):
             return None
             
         except Exception as e:
-            print(f"   - Could not determine expected dimension for {layer_name}: {e}")
             return None
     
     def _handle_embedding_layer(self, inputs, layer):
         """Handle Embedding layer with column-parallel sharding."""
-        print(f"   - Handling Embedding layer (column-parallel)")
 
         sharded_embeddings = self.sharding_strategy.sharded_weights[f"{layer.name}.embeddings"]
 
         embeddings_tensor = keras.ops.convert_to_tensor(sharded_embeddings, dtype="float32")
         sharded_output = keras.ops.take(embeddings_tensor, inputs, axis=0)
 
-        print(f"   - Computed sharded embedding output shape: {sharded_output.shape}")
         return sharded_output
 
     def _handle_pooling_layer(self, inputs, layer):
         """Handle pooling layer."""
-        print(f"   - Handling pooling layer")
         return layer(inputs)
 
     def _handle_einsum_dense_layer(self, inputs, layer):
         """Handle EinsumDense layer with column-parallel sharding."""
-        print(f"   - Handling EinsumDense layer (column-parallel)")
 
         einsum_kernel = self.sharding_strategy.sharded_weights[f"{layer.name}.kernel"]
 
         kernel_tensor = keras.ops.convert_to_tensor(einsum_kernel, dtype="float32")
         einsum_output = keras.ops.einsum('bsi,ih->bsh', inputs, kernel_tensor)
 
-        print(f"   - Computed sharded einsum output shape: {einsum_output.shape}")
         return einsum_output
 
     def _handle_dense_layer(self, current_input, layer):
@@ -469,7 +451,6 @@ def apply_parameter_sharding_to_existing_model(
     Returns:
         Model with sharded parameters
     """
-    print(f"🔧 Applying parameter sharding to existing model: {model.name}")
     
     sharding_strategy = ParameterShardingStrategy(world_size, rank)
     for pattern, action in config.state_rules.items():
@@ -486,9 +467,7 @@ def apply_parameter_sharding_to_existing_model(
                     'action': action
                 }
                 
-                print(f"   ✅ Sharded {param_name}: {param.shape} -> {sharded_param.shape}")
     
     model._tensor_parallel_sharding = sharding_strategy
     
-    print(f"🎯 Parameter sharding applied to existing model")
     return model 

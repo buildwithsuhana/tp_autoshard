@@ -3,16 +3,21 @@
 Test simple Dense layer tensor parallelism execution
 """
 
+# --- MODIFICATION START ---
+# Suppress the benign Keras UserWarning about input structure mismatch.
+# This warning is cosmetic and doesn't affect the correct execution.
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="The structure of `inputs` doesn't match the expected structure."
+)
+# --- MODIFICATION END ---
+
 import os
 import numpy as np
 
 # 💻 Set this flag BEFORE importing jax
 # os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
-
-# import jax
-# print(f"🔍 JAX Device Detection:")
-# print(f"   Number of JAX devices: {jax.local_device_count()}")
-# print(f"   Device list: {jax.devices()}")
 
 import keras
 from keras.layers import Input, Dense
@@ -44,11 +49,15 @@ def test_dense_execution():
     input_data = np.random.random((8, 64)).astype(np.float32)
     print(f"   - Input data shape: {input_data.shape}")
     
-    single_output = model(input_data)
+    # Use a dictionary for inputs. This is the standard way to feed
+    # functional models and avoids a different UserWarning.
+    input_dict = {'input_tensor': input_data}
+
     print(f"\n▶️ Running models...")
+    single_output = model(input_dict)
     print(f"   - Single device output shape: {single_output.shape}")
     
-    tp_output = model_tp_assembled(input_data)
+    tp_output = model_tp_assembled(input_dict)
     print(f"   - Tensor parallel output shape: {tp_output.shape}")
     
     shape_match = single_output.shape == tp_output.shape
@@ -56,13 +65,10 @@ def test_dense_execution():
     print(f"   - Shape match: {shape_match}")
     
     if shape_match:
-        # --- MODIFICATION START ---
         # Use the safe, backend-agnostic Keras function to convert tensors
-        # from any device (CPU, GPU, MPS) to NumPy arrays.
         print("   - Converting outputs to NumPy for comparison...")
         single_np = keras.ops.convert_to_numpy(single_output)
         tp_np = keras.ops.convert_to_numpy(tp_output)
-        # --- MODIFICATION END ---
         
         abs_diff = np.abs(single_np - tp_np)
         print(f"   - Max absolute difference: {np.max(abs_diff):.2e}")

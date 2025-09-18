@@ -1,17 +1,12 @@
-import logging
 from typing import Sequence
 from keras import Model, layers
 from .config_keras import ConfigKeras
 from .state_actions_keras import SplitKeras
 
-logger = logging.getLogger(__name__)
-
 def analyze_dense_layer_directly(layer: layers.Dense, module: Model, prefix: str) -> str:
     if not isinstance(layer, layers.Dense):
-        return 'generic_dense'
-    
-    output_dim = layer.units if hasattr(layer, 'units') else None
-    
+        return 'generic_dense'    
+    output_dim = layer.units if hasattr(layer, 'units') else None    
     if not output_dim:
         return 'generic_dense'
     
@@ -81,7 +76,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                         )
                     
                     output_rules[f"^{full_name}$"] = {0: "gather"}
-                    logger.info(f"Applied Column-wise sharding to MLP up-projection {full_name} (direct-analysis)")
                 
                 elif mlp_type == 'down_projection':
                     state_rules[f"^{full_name}.kernel$"] = SplitKeras(
@@ -93,7 +87,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                         pass 
 
                     output_rules[f"^{full_name}$"] = {0: "allreduce"}
-                    logger.info(f"Applied Row-wise sharding to MLP down-projection {full_name} (direct-analysis)")
                 
                 else:
                     kernel_dim = 1  
@@ -128,7 +121,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                     )
                 
                 output_rules[f"^{full_name}$"] = {0: "gather -1"}
-                logger.info(f"Applied EinsumDense sharding to {full_name} with equation {equation}")
                 
             elif hasattr(layer, '__class__') and 'Dense' in layer.__class__.__name__:
                 if hasattr(layer, 'kernel') or hasattr(layer, 'weights'):
@@ -154,12 +146,10 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                             )
                     
                     output_rules[f"^{full_name}$"] = {0: "gather -1"}
-                    logger.info(f"Applied generic Dense sharding to {full_name}")
                 
             elif isinstance(layer, layers.Embedding):
                 state_rules[f"^{full_name}.embeddings$"] = SplitKeras(world_size=world_size, dim=1)
                 output_rules[f"^{full_name}$"] = {0: "no_comm"}
-                logger.info(f"Applied Embedding sharding to {full_name}")
                 
             elif isinstance(layer, layers.MultiHeadAttention):
                 state_rules[f"^{full_name}.query_dense.kernel$"] = SplitKeras(world_size=world_size, dim=1)
@@ -178,7 +168,6 @@ def get_default_config_keras(module: Model, device_ids: Sequence[str]) -> Config
                     state_rules[f"^{full_name}.output_dense.bias$"] = SplitKeras(world_size=world_size, dim=0)
 
                 output_rules[f"^{full_name}$"] = {0: "allreduce"}
-                logger.info(f"Applied Column->Row pattern to {full_name}")
             
             elif isinstance(layer, layers.LayerNormalization):
                 pass

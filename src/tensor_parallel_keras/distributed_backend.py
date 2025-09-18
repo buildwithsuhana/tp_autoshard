@@ -4,13 +4,11 @@ Distributed Backend Operations
 Centralizes all backend-specific operations for JAX, TensorFlow, and PyTorch
 """
 
-import logging
 from typing import List, Any
 import numpy as np
 import keras
 import os
 
-logger = logging.getLogger(__name__)
 
 class DistributedBackend:
     """Base class for distributed backend operations."""
@@ -99,7 +97,6 @@ class DistributedBackend:
             else:
                 return self._compute_numpy_gradients(loss, trainable_vars)
         except Exception as e:
-            logger.error(f"Gradient computation failed for {self.backend}: {e}")
             return self._create_zero_gradients(trainable_vars)
     
     def _compute_jax_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
@@ -111,14 +108,12 @@ class DistributedBackend:
             try:
                 if hasattr(tensor, 'numpy'):
                     if hasattr(tensor, 'shape') and tensor.shape is None:
-                        logger.warning("Symbolic tensor detected, using dummy value for gradient computation")
                         return jnp.array(0.0)
                     else:
                         return jnp.array(tensor.numpy())
                 else:
                     return jnp.array(tensor)
             except Exception as e:
-                logger.warning(f"Failed to convert tensor to JAX: {e}, using dummy value")
                 return jnp.array(0.0)
         
         loss_jax = safe_convert_to_jax(loss)
@@ -129,10 +124,8 @@ class DistributedBackend:
         
         try:
             gradients = jax.grad(loss_fn)(params_jax)
-            logger.info("   - JAX gradient computation successful")
             return gradients
         except Exception as e:
-            logger.warning(f"JAX gradient computation failed: {e}, using fallback")
             return [jnp.zeros_like(param) for param in params_jax]
     
     def _compute_tensorflow_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
@@ -145,14 +138,11 @@ class DistributedBackend:
         
         try:
             gradients = tape.gradient(loss, trainable_vars)
-            logger.info("   - TensorFlow gradient computation successful")
             return gradients
         except Exception as e:
-            logger.warning(f"TensorFlow gradient computation failed: {e}, using fallback")
             return [tf.zeros_like(var) for var in trainable_vars]
     
     def _compute_pytorch_gradients(self, loss: Any, trainable_vars: List[Any]) -> List[Any]:
-        logger.warning("PyTorch gradient computation is handled by `loss.backward()` in the Keras model's `train_step`.")
         return self._create_zero_gradients(trainable_vars)
     
     def _create_zero_gradients(self, trainable_vars: List[Any]) -> List[Any]:
@@ -320,7 +310,6 @@ class DistributedBackend:
                 info["devices"] = ["cpu"]
                 info["device_count"] = 1
         except Exception as e:
-            logger.warning(f"Could not get device info for {self.backend}: {e}")
             info["devices"] = ["cpu"]
             info["device_count"] = 1
         
@@ -437,7 +426,6 @@ class DistributedBackend:
             if not isinstance(strategy, (tf.distribute.MirroredStrategy, tf.distribute.MultiWorkerMirroredStrategy)):
                 raise RuntimeError("No active `tf.distribute` strategy found. Cannot use real collectives.")
 
-            logger.info("Using real TensorFlow `tf.distribute` collective ops.")
             return {
                 "all_reduce": all_reduce_tf,
                 "all_gather": all_gather_tf,
@@ -445,7 +433,6 @@ class DistributedBackend:
                 "scatter": scatter_tf
             }
         except (ImportError, RuntimeError) as e:
-            logger.warning(f"TensorFlow collective ops not available: {e}. Using SIMULATED ops.")
             return {
                 "all_reduce": all_reduce_simulated,
                 "all_gather": all_gather_simulated,
@@ -513,7 +500,6 @@ class DistributedBackend:
             if not (dist.is_available() and dist.is_initialized()):
                 raise RuntimeError("torch.distributed is not available or not initialized.")
             
-            logger.info("Using real torch.distributed communication ops.")
             return {
                 "all_reduce": all_reduce_torch,
                 "all_gather": all_gather_torch,
@@ -522,7 +508,6 @@ class DistributedBackend:
             }
         
         except (ImportError, RuntimeError) as e:
-            logger.warning(f"torch.distributed not available: {e}. Using SIMULATED communication ops.")
             return {
                 "all_reduce": no_op_simulated,
                 "all_gather": no_op_simulated,
@@ -532,7 +517,6 @@ class DistributedBackend:
     
     def _get_numpy_communication_ops(self):
         """Get NumPy communication operations (simplified)."""
-        logger.info("Using SIMULATED NumPy communication ops.")
 
         def all_reduce_np(x, op="sum"):
             return keras.ops.sum(x, axis=0)

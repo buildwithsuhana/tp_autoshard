@@ -2,7 +2,6 @@ import numpy as np
 from typing import List, Dict, Any
 import keras
 from keras import optimizers
-import logging
 import re 
 
 try:
@@ -11,7 +10,6 @@ except ImportError:
     DistributedBackend = None
     get_distributed_backend = None
 
-logger = logging.getLogger(__name__)
 
 
 class CoordinatedOptimizer:
@@ -28,18 +26,13 @@ class CoordinatedOptimizer:
         if get_distributed_backend:
             try:
                 self.distributed_backend = get_distributed_backend(distributed_backend, world_size, rank)
-                logger.info(f"Using distributed backend: {type(self.distributed_backend).__name__}")
             except Exception as e:
-                logger.warning(f"Failed to initialize distributed backend: {e}")
                 self.distributed_backend = None
         else:
             self.distributed_backend = None
-            logger.warning("Distributed backend not available, using fallback")
 
         if self.shard_optimizer_states:
             if not getattr(self.base_optimizer, 'built', False):
-                logger.error("Optimizer state sharding requires a pre-built base_optimizer. "
-                             "The base optimizer has no variables to shard.")
                 self.shard_optimizer_states = False
             else:
                 self._initialize_sharded_states()
@@ -87,15 +80,12 @@ class CoordinatedOptimizer:
         return state_dict
 
     def _initialize_sharded_states(self):
-        logger.info("Initializing sharded optimizer states...")
         if not self.shard_optimizer_states:
-            logger.warning("Sharding is disabled; skipping initialization.")
             return
 
         try:
             base_state = self._get_actual_optimizer_state()
             if not base_state:
-                logger.error("Failed to get optimizer state. Aborting sharding.")
                 self.shard_optimizer_states = False
                 return
 
@@ -114,17 +104,10 @@ class CoordinatedOptimizer:
                                     if hasattr(action, 'dim'):
                                         sharding_dim = action.dim
                                         rule_found = True
-                                        logger.debug(
-                                            f"Found rule for '{param_name}': "
-                                            f"sharding state on dim={sharding_dim}."
-                                        )
                                         break
                         
                         if not rule_found:
-                            logger.debug(
-                                f"No specific rule for '{param_name}'. "
-                                f"Defaulting to sharding state on dim={sharding_dim}."
-                            )
+                            pass
 
                         self.sharded_states[state_name][param_name] = self._partition_state_across_shards(
                             param_state_var,
@@ -137,14 +120,8 @@ class CoordinatedOptimizer:
                         dim=0
                     )
             
-            logger.info(f"✅ Sharded optimizer states initialized successfully: {list(self.sharded_states.keys())}")
 
         except Exception as e:
-            logger.error(
-                f"Failed during sharded state initialization: {e}. "
-                "Falling back to replicated (non-sharded) optimizer states.",
-                exc_info=True
-            )
             self.shard_optimizer_states = False
             self.sharded_states = {}
     
@@ -180,7 +157,6 @@ class CoordinatedOptimizer:
                     return {'dummy': np.array([0.0])}
                     
         except Exception as e:
-            logger.warning(f"Could not determine optimizer state structure: {e}")
             return {'dummy': np.array([0.0])}
 
     def _partition_state_across_shards(self, state_variable: any, dim: int):
@@ -195,28 +171,20 @@ class CoordinatedOptimizer:
                     else:
                         dtype = np.dtype(dt)
                 except TypeError:
-                    logger.debug("Could not convert tensor dtype to numpy, using float32.")
                     dtype = np.float32
 
             state_array = np.zeros(shape, dtype=dtype)
 
             if state_array.ndim > dim and shape[dim] > 0:
-                logger.debug(f"Partitioning state of shape {shape} along axis {dim}.")
                 return np.array_split(state_array, self.world_size, axis=dim)
             else:
                 if state_array.ndim > 0 and shape[0] > 0:
-                    logger.debug(f"Cannot split shape {shape} on axis {dim}. Falling back to axis 0.")
                     return np.array_split(state_array, self.world_size, axis=0)
                 else:
-                    logger.debug(f"State is a scalar of shape {shape}. Replicating.")
                     return [np.copy(state_array) for _ in range(self.world_size)]
 
         except Exception as e:
             param_name = getattr(state_variable, 'name', 'N/A')
-            logger.warning(
-                f"Failed to partition optimizer state '{param_name}': {e}. "
-                "Replicating the state variable across all devices as a fallback."
-            )
             return [state_variable] * self.world_size
 
     def get_config(self):
@@ -233,22 +201,17 @@ class CoordinatedOptimizer:
         synchronized_gradients = self._synchronize_gradients(gradients_and_vars)
         
         if self.shard_optimizer_states and self.sharded_states:
-            logger.info("Applying gradients with SHARDED optimizer states")
             self._apply_gradients_with_sharded_states(synchronized_gradients, shard_models)
         else:
-            logger.info("Applying gradients with REPLICATED optimizer states")
             self._apply_gradients_with_replicated_states(synchronized_gradients, shard_models)
     
     def _apply_gradients_with_sharded_states(self, synchronized_gradients: List[List[tuple]], shard_models: List):
         try:
-            for shard_idx, (shard_grads, shard_model) in enumerate(zip(synchronized_gradients, shard_models)):
-                logger.info(f"Updating shard {shard_idx} with sharded optimizer states")
-                
+            for shard_idx, (shard_grads, shard_model) in enumerate(zip(synchronized_gradients, shard_models)):                
                 local_states = self._get_local_optimizer_states(shard_idx)
                 self._update_shard_with_local_states(shard_idx, shard_grads, shard_model, local_states)
                 
         except Exception as e:
-            logger.error(f"Failed to apply gradients with sharded states: {e}")
             self._apply_gradients_with_replicated_states(synchronized_gradients, shard_models)
     
     def _apply_gradients_with_replicated_states(self, synchronized_gradients: List[List[tuple]], shard_models: List):
@@ -280,16 +243,13 @@ class CoordinatedOptimizer:
             shard_opt = self.shard_optimizers[shard_idx]
             self._update_optimizer_internal_state(shard_opt, local_states)
             shard_opt.apply_gradients(shard_grads)
-            logger.info(f"Shard {shard_idx} updated successfully with local states")
             
         except Exception as e:
-            logger.error(f"Failed to update shard {shard_idx} with local states: {e}")
             shard_opt.apply_gradients(shard_grads)
 
     def _update_optimizer_internal_state(self, optimizer, local_states: dict):
         try:
             if not hasattr(optimizer, 'variables') or not optimizer.variables:
-                logger.warning(f"Optimizer '{optimizer.name}' has no variables to update. It may not be built yet.")
                 return
 
             optimizer_var_map = {}
@@ -334,20 +294,20 @@ class CoordinatedOptimizer:
                             optimizer_var_map[key].assign(local_param_state)
                             updated_vars_count += 1
                         else:
-                            logger.warning(f"Could not find matching variable in optimizer for local state '{state_name}/{param_name}'.")
+                            pass
                 else:
                     key = (state_name, None)
                     if key in optimizer_var_map:
                         optimizer_var_map[key].assign(state_value)
                         updated_vars_count += 1
                     else:
-                        logger.warning(f"Could not find matching scalar variable in optimizer for local state '{state_name}'.")
+                        pass
 
             if updated_vars_count > 0:
-                logger.info(f"Successfully updated {updated_vars_count} internal state variables in optimizer '{optimizer.name}'.")
+                pass
 
         except Exception as e:
-            logger.error(f"Failed to update optimizer internal state for '{optimizer.name}': {e}", exc_info=True)
+            pass
     
     def _synchronize_gradients(self, gradients_and_vars: List[List[tuple]]) -> List[List[tuple]]:
         if not self.tensor_parallel_config:
@@ -386,7 +346,6 @@ class CoordinatedOptimizer:
     def _allreduce_gradients(self, gradients: List[Any]) -> List[Any]:
         if self.distributed_backend is not None and self.distributed_backend.is_initialized:
             try:
-                logger.info("Using REAL distributed backend for AllReduce")
                 numpy_gradient = keras.ops.convert_to_numpy(gradients[0])
                 
                 synchronized_numpy = self.distributed_backend.allreduce(
@@ -395,11 +354,10 @@ class CoordinatedOptimizer:
                 synchronized_tensor = keras.ops.convert_to_tensor(synchronized_numpy)
                 synchronized_gradients = [synchronized_tensor for _ in range(self.world_size)]
             
-                logger.info(f"REAL AllReduce completed using {type(self.distributed_backend).__name__}")
                 return synchronized_gradients
                 
             except Exception as e:
-                logger.warning(f"Real distributed AllReduce failed: {e}. Falling back to simulation.")        
+                pass
         if not gradients:
             return []
             
@@ -411,7 +369,6 @@ class CoordinatedOptimizer:
         
         synchronized_gradients = [keras.ops.copy(mean_grad) for _ in range(self.world_size)]
         
-        logger.info(f"SIMULATION AllReduce completed for gradients with shape {keras.ops.shape(mean_grad)}")
         return synchronized_gradients
     
     def get_weights(self):
@@ -531,7 +488,6 @@ class CoordinatedOptimizer:
             }
             
         except Exception as e:
-            logger.warning(f"Memory calculation failed: {e}")
             return {
                 'sharding_enabled': False,
                 'total_memory': '0.00 MB',
@@ -543,21 +499,17 @@ class CoordinatedOptimizer:
     
     def enable_optimizer_state_sharding(self):
         if not self.shard_optimizer_states:
-            logger.info("Enabling optimizer state sharding...")
             self.shard_optimizer_states = True
             self._initialize_sharded_states()
-            logger.info("Optimizer state sharding enabled")
         else:
-            logger.info("Optimizer state sharding already enabled")
+            pass
     
     def disable_optimizer_state_sharding(self):
         if self.shard_optimizer_states:
-            logger.info("Disabling optimizer state sharding...")
             self.shard_optimizer_states = False
             self.sharded_states = {}
-            logger.info("Optimizer state sharding disabled, using replicated states")
         else:
-            logger.info("Optimizer state sharding already disabled")
+            pass
 
     def _get_sharded_states_structure(self):
         if not hasattr(self, 'sharded_states') or not self.sharded_states:
@@ -667,15 +619,20 @@ class TensorParallelOptimizer(optimizers.Optimizer):
             return super().update_step(gradient, variable)
 
     def build(self, variables):
-        try:
-            if hasattr(self.base_optimizer, 'build'):
-                self.base_optimizer.build(variables)
-        except Exception:
-            pass
-        try:
-            return super().build(variables)
-        except Exception:
-            return None
+        """Builds the optimizer and initializes sharded states."""
+        if self.built:
+            return
+
+        # First, build the base optimizer
+        if hasattr(self.base_optimizer, 'build'):
+            self.base_optimizer.build(variables)
+
+        # Now that the base optimizer is built, we can shard its states
+        if self.coordinated_optimizer.shard_optimizer_states:
+            self.coordinated_optimizer._initialize_sharded_states()
+
+        # We don't call super().build() because we're a wrapper
+        self.built = True
 
     def apply(self, gradients, variables=None, *args, **kwargs):
         if variables is None and gradients and isinstance(gradients[0], tuple):

@@ -3,7 +3,6 @@ import time
 import logging
 import numpy as np
 
-# --- STEP 1: Import TensorFlow and apply visibility fix ---
 import tensorflow as tf
 try:
     tf.config.set_visible_devices([], 'GPU')
@@ -11,8 +10,7 @@ try:
     print("✅ TensorFlow visibility successfully set to CPU-only.")
 except RuntimeError:
     print("⚠️ Could not set TensorFlow visible devices. (May already be initialized)")
-
-# --- STEP 2: SET KERAS BACKEND (MUST BE BEFORE IMPORTING KERAS) ---
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=9"
 os.environ["KERAS_BACKEND"] = "jax"
 
 # --- STEP 3: Now import JAX, Keras, and all other libraries ---
@@ -26,31 +24,48 @@ import tensorflow_datasets as tfds
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- JAX Device Detection ---
+# --- JAX Device Detection (MODIFIED SECTION) ---
 try:
-    devices = jax.devices()
-    print(f"JAX devices found: {[str(d) for d in devices]}")
-    tpu_devices = [d for d in devices if d.platform == 'tpu']
-    print(f"Found {len(tpu_devices)} TPU devices.")
+    all_devices = jax.devices()
+    print(f"All JAX devices found: {[str(d) for d in all_devices]}")
+
+    # Auto-identify platform, prioritizing TPU > GPU > CPU
+    tpu_devices = [d for d in all_devices if d.platform == 'tpu']
+    gpu_devices = [d for d in all_devices if d.platform == 'gpu']
+    cpu_devices = [d for d in all_devices if d.platform == 'cpu']
     
-    DEVICES_AVAILABLE = len(tpu_devices)
-    # --- CHANGE: Hardcode target world size to 2 ---
-    WORLD_SIZE = 2 
-    
-    if DEVICES_AVAILABLE < WORLD_SIZE:
-        print(f"⚠️ WARNING: Requested {WORLD_SIZE} TPUs, but only {DEVICES_AVAILABLE} are available.")
-        # As a fallback, we'll try to run with fewer devices
-        TARGET_DEVICES = tpu_devices
-        TARGET_WORLD_SIZE = DEVICES_AVAILABLE
+    if tpu_devices:
+        target_devices = tpu_devices
+        platform = "TPU"
+    elif gpu_devices:
+        target_devices = gpu_devices
+        platform = "GPU"
+    elif cpu_devices:
+        target_devices = cpu_devices
+        platform = "CPU"
     else:
-        TARGET_DEVICES = tpu_devices[:WORLD_SIZE]
-        TARGET_WORLD_SIZE = WORLD_SIZE
-        print(f"✅ Found {DEVICES_AVAILABLE} TPUs. Targeting the first {TARGET_WORLD_SIZE} for parallelism: {[str(d) for d in TARGET_DEVICES]}")
+        target_devices = all_devices # Fallback
+        platform = "Unknown"
+    
+    # --- AUTO-IDENTIFICATION ---
+    # Set WORLD_SIZE based on the number of devices found on the primary platform
+    WORLD_SIZE = len(target_devices)
+    # --- END AUTO-IDENTIFICATION ---
+    
+    DEVICES_AVAILABLE = WORLD_SIZE
+    TARGET_DEVICES = target_devices
+    TARGET_WORLD_SIZE = WORLD_SIZE
+    
+    if TARGET_WORLD_SIZE == 0:
+        print("⚠️ WARNING: No usable JAX devices found!")
+    else:
+        print(f"✅ Auto-identified {TARGET_WORLD_SIZE} devices on platform: {platform}")
+        print(f"   Targeting all {TARGET_WORLD_SIZE} devices for parallelism: {[str(d) for d in TARGET_DEVICES]}")
 
 except Exception as e:
     print(f"Could not initialize JAX or find devices. Error: {e}")
     TARGET_WORLD_SIZE = 0
-# --- END NEW ---
+# --- END MODIFIED SECTION ---
 
 
 try:
@@ -127,44 +142,6 @@ def get_model_from_preset(preset_name, model_class):
     print(f"      ✅ Model created with {model.count_params():,} parameters.")
     return model
 
-# ----------------------------------------------------------------------
-# --- Plotting Function (UNCHANGED) ---
-# ----------------------------------------------------------------------
-
-def plot_training_graphs(baseline_history, tp_history, preset_name):
-    """Plots and saves the loss and perplexity graphs for a given model comparison."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    fig.suptitle(f"{preset_name} - Baseline vs. Tensor Parallel Training", fontsize=16)
-
-    ax1.plot(baseline_history.history["loss"], label="Baseline - Training Loss", color="blue", linestyle="-")
-    ax1.plot(baseline_history.history["val_loss"], label="Baseline - Validation Loss", color="blue", linestyle="--")
-    ax1.plot(tp_history.history["loss"], label="Tensor Parallel - Training Loss", color="green", linestyle="-")
-    ax1.plot(tp_history.history["val_loss"], label="Tensor Parallel - Validation Loss", color="green", linestyle="--")
-    ax1.set_title("Training and Validation Loss")
-    ax1.set_ylabel("Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.legend()
-    ax1.grid(True)
-
-    ax2.plot(baseline_history.history["perplexity"], label="Baseline - Training Perplexity", color="red", linestyle="-")
-    ax2.plot(baseline_history.history["val_perplexity"], label="Baseline - Validation Perplexity", color="red", linestyle="--")
-    ax2.plot(tp_history.history["perplexity"], label="Tensor Parallel - Training Perplexity", color="purple", linestyle="-")
-    ax2.plot(tp_history.history["val_perplexity"], label="Tensor Parallel - Validation Perplexity", color="purple", linestyle="--")
-    ax2.set_title("Training and Validation Perplexity")
-    ax2.set_ylabel("Perplexity")
-    ax2.set_xlabel("Epoch")
-    ax2.legend()
-    ax2.grid(True)
-
-    output_filename = f"{preset_name}_tp_verification_comparison.png"
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_filename)
-    print(f"\n   ✅ Comparison graph saved to {output_filename}")
-    plt.close() 
-
-# ----------------------------------------------------------------------
-# --- Main Verification Function (MODIFIED) ---
-# ----------------------------------------------------------------------
 
 def run_model_verification(preset_name, model_class):
     """Runs the full training verification test for a given model preset."""
@@ -281,10 +258,6 @@ def run_model_verification(preset_name, model_class):
     tp_final_val_loss = tp_history.history['val_loss'][-1]
     # loss_diff = abs(baseline_final_val_loss - tp_final_val_loss)
     
-    print(f"      Baseline Final Validation Loss: {baseline_final_val_loss:.4f}")
-    print(f"      TP Final Validation Loss:       {tp_final_val_loss:.4f}")
-    print(f"      Final Validation Loss Difference: {loss_diff:.6f}")
-    
     # --- NEW: Print Performance Metrics ---
     print("\n   --- Performance Comparison ---")
     # print(f"      Baseline Training Time: {baseline_time:.2f} s")
@@ -313,6 +286,8 @@ if __name__ == "__main__":
     # --- Check for devices before starting ---
     if TARGET_WORLD_SIZE == 0:
         print("🛑 ERROR: No JAX TPUs found. Aborting verification suite.")
+        # --- FIX: Need to import sys for sys.exit ---
+        import sys
         sys.exit(1)
         
     print("\n🎯 TENSOR PARALLELISM VERIFICATION SUITE")

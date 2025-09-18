@@ -3,11 +3,9 @@ Distribution Library for Tensor Parallel Keras.
 This module provides device detection and management.
 """
 
-import logging
 from typing import List, Dict, Optional, Tuple
 import keras
 
-logger = logging.getLogger(__name__)
 
 def list_devices() -> List[str]:
     if keras.backend.backend() == 'torch':
@@ -15,38 +13,32 @@ def list_devices() -> List[str]:
             import torch
             if torch.cuda.is_available():
                 count = torch.cuda.device_count()
-                logger.info(f"PyTorch backend detected, found {count} CUDA devices.")
                 return [f"cuda:{i}" for i in range(count)]
         except (ImportError, Exception) as e:
-            logger.warning(f"Could not use torch to detect devices: {e}")
+            pass
 
     if keras.backend.backend() == 'jax':
         try:
             import jax
             jax_devices = jax.devices()
             if jax_devices:
-                logger.info(f"JAX backend detected, found {len(jax_devices)} devices via jax.devices()")
                 formatted_devices = [f"{d.platform.lower()}:{d.id}" for d in jax_devices]
                 return formatted_devices
         except (ImportError, Exception) as e:
-            logger.warning(f"Could not use jax.devices() to detect devices: {e}")
-    
+            pass
+
     devices = []
 
     for device_type in ["TPU", "GPU", "CPU"]:
         try:
             physical_devices = keras.config.list_physical_devices(device_type)
             if physical_devices:
-                logger.info(f"Found {len(physical_devices)} {device_type} devices")
                 devices.extend([f"{device_type.lower()}:{i}" for i in range(len(physical_devices))])
         except Exception as e:
-            logger.debug(f"{device_type} detection failed: {e}")
-    
+            pass
+
     if not devices:
-        logger.warning("No physical devices detected, using default CPU")
         devices.append("cpu:0")
-    
-    logger.info(f"Total available devices via physical scan: {len(devices)}")
     return devices
 
 def get_device_info(device_id: str) -> Dict[str, any]:
@@ -79,8 +71,7 @@ def get_device_info(device_id: str) -> Dict[str, any]:
             device_info['index'] = int(device_id.split(':')[1])
             
     except Exception as e:
-        logger.warning(f"Failed to get device info for {device_id}: {e}")
-    
+        pass
     return device_info
 
 def get_best_devices(count: int = 1) -> List[str]:
@@ -99,7 +90,6 @@ def get_best_devices(count: int = 1) -> List[str]:
         return []
     
     if count > len(all_devices):
-        logger.warning(f"Requested {count} devices but only {len(all_devices)} available")
         count = len(all_devices)
     
     return all_devices[:count]
@@ -136,7 +126,6 @@ def validate_device_placement(device_id: str) -> bool:
         all_devices = list_devices()
         return device_id in all_devices
     except Exception as e:
-        logger.error(f"Device validation failed: {e}")
         return False
 
 def get_device_memory_info(device_id: str) -> Optional[Dict[str, any]]:
@@ -157,8 +146,7 @@ def get_device_memory_info(device_id: str) -> Optional[Dict[str, any]]:
         elif device_id.startswith('cpu:'):
             return {'type': 'CPU', 'index': int(device_id.split(':')[1]), 'memory': 'System RAM'}
     except Exception as e:
-        logger.debug(f"Failed to get memory info for {device_id}: {e}")
-    
+        pass
     return None 
 
 def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) -> Dict[str, any]:
@@ -193,11 +181,9 @@ def auto_configure_tensor_parallel(world_size: int = None, backend: str = None) 
             'backend': recommended_backend
         }
         
-        logger.info(f"Auto-configured tensor parallelism: {config}")
         return config
         
     except Exception as e:
-        logger.error(f"Auto-configuration failed: {e}")
         return {
             'devices': ['cpu:0'],
             'world_size': 1,

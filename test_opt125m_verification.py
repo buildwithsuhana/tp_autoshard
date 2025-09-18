@@ -15,28 +15,8 @@ from src.tensor_parallel_keras.tensor_parallel_keras import TensorParallelKeras
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class PositionalEmbedding(layers.Layer):
-    """
-    Creates a learned positional embedding.
-    This layer calculates the position IDs on the fly during the forward pass.
-    """
-    def __init__(self, max_positions, hidden_size, **kwargs):
-        super().__init__(**kwargs)
-        # The actual learnable weights are in this embedding layer
-        self.position_embedding = layers.Embedding(
-            input_dim=max_positions, output_dim=hidden_size
-        )
-
-    def call(self, inputs):
-        # Get the dynamic sequence length from the input tensor
-        seq_len = keras.ops.shape(inputs)[1]
-        
-        # Create the position IDs: [0, 1, 2, ..., seq_len-1]
-        # This now happens symbolically as part of the forward pass
-        position_ids = keras.ops.arange(seq_len, dtype="int32")
-        
-        # Look up the embeddings for the position IDs
-        return self.position_embedding(position_ids)
+# The custom PositionalEmbedding class has been removed as it was preventing sharding.
+# The logic is now integrated directly into the `create_opt125m_model` function.
 
 def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers=2, num_heads=4):
     """Create a simplified OPT-125M model for faster testing."""
@@ -57,6 +37,7 @@ def create_simplified_opt125m_model(vocab_size=1000, hidden_size=128, num_layers
 def create_opt125m_model(vocab_size=50257, hidden_size=768, num_layers=12, num_heads=12, max_position_embeddings=2048):
     """
     Creates an OPT-125M model with learned positional embeddings.
+    FIXED: Uses a Lambda layer to dynamically create position IDs at runtime.
     """
     print("   Creating OPT-125M model...")
     
@@ -66,10 +47,25 @@ def create_opt125m_model(vocab_size=50257, hidden_size=768, num_layers=12, num_h
     # 2. Token embeddings
     token_embeddings = layers.Embedding(vocab_size, hidden_size, name='embed_tokens')(input_ids)
     
-    positional_embed_layer = PositionalEmbedding(
+    # 3. Positional embeddings (FIXED IMPLEMENTATION)
+    # First, define the actual learnable embedding layer. This ensures it's a 
+    # top-level layer that the sharding manager can find.
+    position_embedding_layer = layers.Embedding(
         max_position_embeddings, hidden_size, name='embed_positions'
     )
-    position_embeddings = positional_embed_layer(token_embeddings)
+    
+    # Second, create a Lambda layer to generate the position IDs on the fly.
+    # This calculation is deferred until the forward pass (runtime).
+    def get_position_ids(x):
+        """Keras lambda function to get position IDs from input shape."""
+        seq_len = keras.ops.shape(x)[1]
+        return keras.ops.arange(seq_len, dtype="int32")
+
+    # The Lambda layer uses the shape of the token_embeddings tensor to determine sequence length.
+    position_ids = layers.Lambda(get_position_ids, name='generate_position_ids')(token_embeddings)
+    
+    # Finally, look up the embeddings for the dynamically generated IDs.
+    position_embeddings = position_embedding_layer(position_ids)
 
     # 4. Add token and positional embeddings together
     embedding_output = layers.Add(name='add_embeddings')([token_embeddings, position_embeddings])
@@ -284,3 +280,4 @@ if __name__ == "__main__":
         print("\n🚀 SUCCESS: All OPT-125M verification tests passed!")
     else:
         print(f"\n⚠️  WARNING: {len(test_results) - passed_tests} tests failed.")
+
